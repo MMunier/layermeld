@@ -155,6 +155,11 @@ categories:
   (07 §7.2).
 - `serde`, `serde_json` — OCI config / manifest / index JSON
   (08, 09).
+- `oci-spec` — typed Rust models of the OCI image config,
+  manifest, index, and `oci-layout` documents (08, 09). Used
+  for both parsing inputs (01) and emitting outputs; avoids
+  re-deriving the OCI v1 schema in tree. Pin a single major
+  version in `Cargo.toml` so schema drift is a deliberate bump.
 - `clap` (derive feature) — CLI parsing (10).
 
 **Useful for the implementation shape we want.**

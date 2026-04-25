@@ -92,6 +92,23 @@ disk under `blobs/sha256/<digest>`; the manifests just point at it.
 This is what actually realizes the size savings on consumer
 registries that dedup by digest.
 
+## 8.4a Serialization
+
+Output configs, manifests, and the index (09 §9.2) are
+constructed and serialized via `oci-spec`'s typed builders, not
+by hand-assembling `serde_json::Value` trees. The same crate is
+used to parse inputs (01 §1.7a), so a round-trip through
+`oci-spec` is the canonical schema for both directions.
+
+`oci-spec`'s default JSON serialization is the byte form that
+lands in `blobs/sha256/<digest>` and is what the digest is
+computed over. Field ordering inside each document is whatever
+`oci-spec` emits; the determinism contract (11) holds because
+that ordering is a pure function of the crate version pinned in
+`Cargo.toml`. A bump of `oci-spec` may legitimately change
+output digests and is treated like any other determinism-test
+expected-digest update.
+
 ## 8.5 Validation
 
 Before writing the output, each manifest is validated against:

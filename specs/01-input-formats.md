@@ -59,6 +59,22 @@ naming the path and the markers that were looked for.
   tool does not attempt to read.
 - `.sif`, `.sqfs`, or other non-OCI container formats.
 
+## 1.7a Parsing
+
+Image configs, manifests, indexes, and the `oci-layout` marker file
+are parsed via the `oci-spec` crate's typed models rather than
+hand-rolled `serde_json::Value` traversal. This applies uniformly
+to all input shapes in 1.1–1.5: a Docker-archive `manifest.json`
+and an OCI `index.json` are both deserialized into `oci-spec`
+types, with the small Docker-archive shape adapted into the same
+internal `InputImage` model the rest of the pipeline consumes.
+
+Fields the tool does not care about (e.g. arbitrary annotations
+on input manifests beyond the `ref.name` carried through per
+08 §8.2) are still parsed by `oci-spec` but ignored downstream.
+Unknown extension fields do not cause rejection unless they
+break a schema invariant `oci-spec` itself enforces.
+
 ## 1.8 Compression
 
 Layer blobs may be uncompressed tar, gzip, or zstd. The media type on
