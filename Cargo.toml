@@ -1,0 +1,37 @@
+[package]
+name = "container-squash"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic OCI/Docker image squasher with cross-image deduplication."
+
+[lib]
+name = "container_squash"
+path = "src/lib.rs"
+
+[[bin]]
+name = "container-squash"
+path = "src/main.rs"
+
+[dependencies]
+tar = "0.4"
+flate2 = "1"
+zstd = "0.13"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+oci-spec = "0.7"
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
