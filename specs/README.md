@@ -53,6 +53,10 @@ The size reduction is achieved by:
 Each spec file below is intentionally single-concern. Read in order the
 first time; individual files are self-contained after that.
 
+- [00-project-structure.md](00-project-structure.md) — language,
+  crate shape, module-to-spec mapping, dependency policy, and
+  test layout. Meta-spec: describes the implementation, not the
+  tool's behavior.
 - [01-input-formats.md](01-input-formats.md) — which on-disk image
   layouts are accepted as input.
 - [02-tar-handling.md](02-tar-handling.md) — the "no unpacking" rule and
