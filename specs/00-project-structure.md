@@ -9,7 +9,7 @@ in the tree each piece of behavior lives*.
 
 ## 0.1 Language and toolchain
 
-The tool is written in **Rust**, edition 2021. The MSRV (minimum
+The tool is written in **Rust**, edition 2024. The MSRV (minimum
 supported rustc) is pinned in `rust-toolchain.toml` at the
 repository root and tracked alongside the code; bumping it is a
 deliberate change, not an accident of CI. Stable toolchain only —
