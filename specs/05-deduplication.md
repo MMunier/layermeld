@@ -10,40 +10,67 @@ The savings target is "every byte that appears in two or more images
 is stored on disk exactly once", which is stronger than the simple
 "layer common to all images" model.
 
-## 5.1 Membership sets
+## 5.1 Naive and effective membership
 
 For every entry `e` (identified by its full `FileIdentity` per
 04-file-identity, i.e. path + mode + uid + gid + content_hash + …),
-its **membership set** is the set of input images that contain a
-byte-equal `FileIdentity`:
+its **naive membership** is the set of input images that contain a
+byte-equal `FileIdentity` at the same path:
 
 ```
-members(e) = { i ∈ 0..N : e ∈ entries(i) }
+naive(e) = { i ∈ 0..N : e ∈ entries(i) }
 ```
 
-Two entries that match by `FileIdentity` always have the same
-membership set, by construction.
+Naive membership is not directly usable for layer placement,
+because of the overlayfs "implicit-parent" pitfall (5.4). The
+correct quantity is **effective membership**:
+
+```
+eff(e) = naive(e) ∩ ⋂_{A strict ancestor of e.path} naive(A_in_image_i)
+```
+
+evaluated for any reference image `i ∈ naive(e)`. (The choice of
+`i` does not change the result inside the intersection: if any
+ancestor's identity disagrees with image `i`'s view, the
+disagreeing image is removed from the intersection regardless of
+which `i` we picked.)
+
+Equivalently: `eff(e)` is the largest set of images that agree on
+`e`'s identity *and* on every ancestor's identity all the way up
+to `/`. Files whose naive membership splits into multiple
+ancestor-equivalence classes appear once per class — their bytes
+are duplicated across those classes' layers. This is the price of
+overlayfs correctness; see 5.4 for why.
+
+Two entries with the same `FileIdentity` *and* the same effective
+membership go into the same layer. Files with the same
+`FileIdentity` but different effective memberships (because their
+ancestors diverge differently) go into different layers, with
+their bodies duplicated.
 
 ## 5.2 Subset layers
 
-The output contains one layer per **distinct, non-empty membership
-set** that occurs in the inputs. Concretely:
+The output contains one layer per **distinct, non-empty effective
+membership set** that occurs in the inputs. Concretely:
 
-- All entries whose membership set is `{0,1,…,N-1}` (the maximal set
-  — present in every input) go into the **fully-shared layer**.
-- All entries whose membership set is some proper subset
+- All entries with `eff(e) = {0,1,…,N-1}` go into the
+  **fully-shared layer**.
+- All entries with `eff(e) = M` for some proper subset
   `M ⊊ {0,…,N-1}` with `|M| ≥ 2` go into a **partial-shared layer**
   for `M`. There is one such layer per `M` that actually occurs.
-- All entries whose membership set is a singleton `{i}` go into the
-  **per-image layer** for image `i`.
+- All entries with `eff(e) = {i}` go into the **per-image layer**
+  for image `i`.
 
-Empty membership sets are impossible by construction (every entry
-came from at least one image).
+Empty effective memberships are impossible by construction (every
+entry came from at least one image, and the singleton `{i}` is
+always achievable since image `i`'s view of any path agrees with
+itself on every ancestor).
 
-In the worst case there are `2^N − 1` subset layers; in practice many
-subsets do not occur and produce no layer at all. With `N = 2` the
-model degenerates to exactly the three layers `{0,1}`, `{0}`, `{1}`,
-which is the minimal "one shared + two specific" shape.
+In the worst case there are `2^N − 1` subset layers; in practice
+many subsets do not occur and produce no layer at all. With
+`N = 2` the model degenerates to exactly the three layers
+`{0,1}`, `{0}`, `{1}`, which is the minimal "one shared + two
+specific" shape.
 
 ## 5.3 Per-image layer stacks
 
@@ -64,34 +91,106 @@ path with directories emitted before any of their children (same
 rule as before — required for determinism and friendly to
 compression).
 
-## 5.4 Ancestor directories across subset layers
+## 5.4 Ancestor directories: why the implicit-parent rule fails
 
-For every entry that is emitted into some subset layer `M`, every
-strict ancestor directory of its path must be visible to image `i`
-(for every `i ∈ M`) by the time `M` is applied. There are three
-cases:
+It is tempting to assume that a tar layer can omit ancestor
+directory entries and rely on the unpacker to "fix things up"
+later. This assumption is *wrong* under overlayfs, and 5.1's
+effective-membership rule and 5.4.2's duplication rule exist
+precisely to avoid the failure mode it produces.
 
-1. **Ancestor's `FileIdentity` is identical across every image in
-   `M`** *(the common case)*. The ancestor entry is itself a member
-   of some superset `M' ⊇ M`. It is emitted in `M'`'s layer (which
-   precedes `M` in every stack that contains `M`, because `|M'| ≥
-   |M|`). No special handling needed.
-2. **Ancestor's `FileIdentity` differs across images in `M`** (e.g.
-   image 0 and 1 share `/usr/lib/foo/bar` but disagree about the
-   mode of `/usr/lib/foo`). Layer `M` emits a *synthetic* minimal
-   directory entry for the ancestor: mode `0755`, uid `0`, gid `0`,
-   no xattrs, normalized timestamp. Each affected image's smaller
-   subset layers (or per-image layer) then carry the actual
-   directory entry, which overrides the synthetic one because it is
-   applied later.
-3. **Ancestor exists only in some images of `M`.** Cannot happen: an
-   ancestor that does not exist in image `i` means image `i` cannot
-   contain a child of it either, so `i` would not be in `M` to begin
-   with.
+### 5.4.1 The shadow problem
 
-The synthetic-ancestor escape hatch is the **only** mechanism by
-which any output layer carries metadata that did not appear verbatim
-in some input image.
+When a tar layer is unpacked into an overlayfs upperdir (the
+mechanism used by containerd's overlay snapshotter, podman's
+overlay storage driver, and every other major image runtime),
+each tar entry materializes inside that single layer's
+upperdir. To create a regular file at `/a/b/c`, the unpacker
+must `mkdir -p` the parent path *inside the upperdir*, because
+the upperdir is just an empty directory at the start of the
+unpack — it has no awareness of lower layers.
+
+`mkdir -p` creates `/a/` and `/a/b/` with the unpacker's
+default metadata (`0755 root:root`, no xattrs). Once those
+directory inodes exist in the upperdir, overlayfs treats them
+as the authoritative version: any lower-layer `/a/` with
+mode `0700` (say) is **shadowed** by the upperdir's
+`0755 root:root`. The merged view that runc and userspace see
+is the wrong metadata.
+
+A later layer in the same image's stack that explicitly emits
+`/a/` with the correct metadata *can* fix this — but only
+because that later layer's upperdir then takes precedence in
+its turn. If no such later layer exists, the wrong metadata
+sticks. Synthetic placeholders in the offending layer plus
+"trust later layers to override" is a fragile design that
+breaks the moment the stack ends without an override.
+
+### 5.4.2 The rule
+
+Every layer L must explicitly contain an entry for every
+strict ancestor of every path in L, with metadata consistent
+across L's effective membership. There are no implicit
+parents in any output layer.
+
+This forces two structural rules on the partition from 5.2:
+
+1. **Effective membership for files** (5.1). A file P with
+   naive membership `M_naive` cannot be placed in a layer
+   whose membership exceeds `M_eff(P)`, because layers with
+   larger membership cannot include a coherent ancestor
+   chain for P (some ancestor's identity diverges across
+   that larger membership). When `M_naive(P)` strictly
+   exceeds `M_eff(P)`, P appears in multiple layers — one
+   per ancestor-agreement class — and its body bytes are
+   duplicated across those layers.
+
+2. **Directory duplication across layers**. A directory D
+   with effective membership `M_D` is emitted into:
+   - its **natural layer** `L(M_D)`, AND
+   - every other layer `L(M)` whose contents include any
+     descendant of D, with `M ⊆ M_D`.
+
+   In every such layer, D's entry uses the same single
+   `FileIdentity` (D's identity is consistent across `M_D`
+   by definition, and every smaller `M ⊆ M_D` inherits that
+   consistency). The duplicated entries differ only in
+   *which layer* they live in — same path, same metadata,
+   same numeric ids, same xattrs. The cost of duplication
+   is one tar header (≈ 512 bytes plus PAX xattr overhead);
+   directory entries have no body.
+
+File entries are NOT duplicated this way. Files appear once
+per ancestor-agreement class (potentially more than once
+across layers, but each appearance has its own distinct
+`(path, M_eff)` reason), not once per layer that happens to
+sit inside the directory.
+
+### 5.4.3 Layer ordering still works
+
+The descending-`|M|` ordering from 5.3 ensures that when a
+layer L's directory entry for D is encountered, any
+larger-membership layer that also contains D has already
+been applied. The two emissions agree on D's identity
+(rule 2 above), so the later application is a no-op for D's
+metadata. The point of the duplicated entry is not to
+override anything; it is to *prevent* the implicit-parent
+shadow described in 5.4.1 from creating the wrong inode in
+L's upperdir in the first place.
+
+### 5.4.4 What never happens
+
+- The tool never emits synthetic `0755 root:root` placeholder
+  ancestors. Every directory entry in every output layer
+  comes from some input image's squashed filesystem, with
+  metadata verbatim from that input.
+- No output layer relies on a later layer to "fix" a wrong
+  ancestor entry. Each layer is internally complete: applying
+  it produces a correct-metadata view of every path it
+  references, including all ancestors.
+- The "ancestor exists only in some images of `M`" case from
+  the previous draft cannot happen: `M ⊆ naive(A)` is implied
+  by `M ⊆ M_eff(P)` for any `P` whose ancestors include `A`.
 
 ## 5.5 Minimum-layer-size compaction
 
@@ -160,13 +259,27 @@ dissolution after the fact. The pass is therefore single-pass and
 terminates in `O(L)` layer visits where `L` is the number of
 candidate subset layers.
 
-### 5.5.4 Synthetic ancestors after dissolve
+### 5.5.4 Ancestor invariant after dissolve
 
-Synthetic ancestor directories (§5.4) are recomputed *after* the
-dissolve pass, against the final layer set. A directory that was
-synthesized for a now-dissolved layer is dropped; one that becomes
-necessary because content moved into a previously-clean layer is
-added.
+The 5.4.2 invariant — every layer contains explicit entries for
+all ancestors of every path it carries — must be preserved by
+the dissolve pass. When file `f` is migrated into destination
+layer `L'`, every strict ancestor of `f.path` that is not
+already explicit in `L'` is added to `L'` as well, with the
+ancestor's `FileIdentity` taken from the consensus across
+`M_{L'}` (which is consistent because `M_{L'} ⊆ M_eff(f) ⊆
+naive(ancestor)`).
+
+Dissolving therefore grows the destination layer by the
+migrated file's body bytes plus possibly a handful of extra
+directory headers. The size estimate from 5.5.1 is recomputed
+for `L'` after each migration so a destination layer that is
+itself near the threshold does not accidentally cross it
+unnoticed.
+
+A layer that crosses the threshold *upward* via dissolve
+absorption simply stops being a dissolve candidate. The pass
+never re-visits a layer that has grown past `--min-layer-size`.
 
 ### 5.5.5 Disabling the pass
 

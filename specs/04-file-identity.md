@@ -97,14 +97,29 @@ any layer or any file; it is internal to the dedup pass.
 
 ## 4.5 Directories
 
-Directory entries participate in identity via path, mode, uid, gid,
-xattrs. The shared layer must contain a directory entry for every
-ancestor of every file it carries; those ancestor entries are taken
-from whichever input image has that ancestor — if the same ancestor
-in two images has *different* metadata (mode/uid/gid/xattrs), then
-that directory's identity does not match across images, and it goes
-into the per-image diff layers instead, with the shared layer falling
-back to a synthetic minimal entry (see 05).
+Directory entries participate in identity via path, mode, uid,
+gid, and xattrs (size and content_hash are always zero/none for
+directories). The identity tuple is the same shape as a regular
+file's, just with `kind = Dir` and `content_hash = None`.
+
+Layer placement for directories is **not** the same as for
+files. Per 05 §5.4, every layer must explicitly contain entries
+for all strict ancestors of every path it carries — otherwise
+overlayfs implicit-parent creation in the upperdir shadows the
+correct metadata from lower layers. As a result, a directory
+entry typically appears in **multiple** output layers: its own
+"natural" layer (per its effective membership) plus every
+smaller subset layer that contains a descendant of it.
+
+The duplicated entries are byte-identical (same path, same
+metadata, same xattrs) — only the layer they live in differs.
+Each emission is a tar header with no body, so the on-disk cost
+of duplication is the header size (≈ 512 bytes plus PAX xattr
+overhead) per extra layer.
+
+File entries do not participate in this duplication: a file
+appears in exactly one layer per ancestor-equivalence class of
+its naive membership (see 05 §5.1).
 
 ## 4.6 Sparse files
 

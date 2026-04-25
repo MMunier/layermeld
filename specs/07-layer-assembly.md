@@ -9,7 +9,6 @@ from an OCI manifest.
 - The set of subset layers from 05, each represented as a list of
   `(image_id, layer_idx, entry_idx)` references back into the
   original input archives plus the resolved `FileIdentity`.
-- The synthetic ancestor directory entries from 05 §5.4.
 - The normalized timestamp `T0` from 06.
 - A scratch output directory provided by the CLI.
 
@@ -52,6 +51,15 @@ zstd-compressed layer, and never emits the corresponding media
 types.
 
 ## 7.4 Tar entry emission
+
+The assembler emits exactly the entries from the layer's sorted
+entry list, which by construction (05 §5.4.2) already contains
+explicit entries for every strict ancestor of every path in the
+layer. The assembler never *synthesizes* missing ancestors with
+default metadata — overlayfs would shadow the correct
+metadata in lower layers if it did. Equivalently: if 05 produced
+a layer entry list that omits an ancestor of one of its paths,
+that is a bug in 05, not something for 07 to paper over.
 
 For each entry in the layer's sorted entry list (per 05 §5.5):
 
