@@ -29,9 +29,12 @@
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
 
 use oci_spec::image::{Digest, ImageConfiguration, ImageManifest};
 
+use crate::input::model::{InputImage, LayerHandle, platform_from_config};
 use crate::{Error, Result};
 
 /// Reader for a `dir`-transport image input.
@@ -171,6 +174,62 @@ impl DirTransportReader {
         let bytes = self.read_blob_to_end(self.manifest.config().digest())?;
         ImageConfiguration::from_reader(&*bytes)
             .map_err(|e| Error::MalformedInput(format!("cannot parse image config: {e}")))
+    }
+
+    /// Normalise this directory into the shared [`InputImage`] model.
+    /// Returned as a `Vec` for parity with the other transports even
+    /// though spec 01 §1.5 says a `dir`-transport directory carries
+    /// exactly one image.
+    ///
+    /// `repo_tags` is always empty: the `dir:` transport stores no
+    /// tags (spec 01 §1.5). Spec 09 §9.2 then surfaces the image as
+    /// untagged in the output index.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::MalformedInput`] if the config blob is missing or
+    ///   unparseable, or if `rootfs.diff_ids` length does not match
+    ///   the manifest's layer count.
+    pub fn into_images(self) -> Result<Vec<InputImage>> {
+        let config = self.read_config()?;
+        let manifest = self.manifest.clone();
+        let reader = Arc::new(self);
+
+        let diff_ids = config.rootfs().diff_ids();
+        let layer_descriptors = manifest.layers();
+        if diff_ids.len() != layer_descriptors.len() {
+            return Err(Error::MalformedInput(format!(
+                "dir-transport config diff_ids ({}) do not align with manifest layers ({})",
+                diff_ids.len(),
+                layer_descriptors.len(),
+            )));
+        }
+
+        let layers: Vec<LayerHandle> = layer_descriptors
+            .iter()
+            .zip(diff_ids)
+            .map(|(desc, diff_id_str)| {
+                let diff_id = Digest::from_str(diff_id_str).map_err(|e| {
+                    Error::MalformedInput(format!("invalid diff_id `{diff_id_str}` in dir-transport config: {e}"))
+                })?;
+                let layer_digest = desc.digest().clone();
+                let media_type = desc.media_type().to_string();
+                let size = desc.size();
+                let reader = reader.clone();
+                let opener_digest = layer_digest.clone();
+                LayerHandle::new(layer_digest, diff_id, size, media_type, move || {
+                    reader.open_blob(&opener_digest)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let platform = platform_from_config(&config);
+        Ok(vec![InputImage {
+            config,
+            layers,
+            repo_tags: Vec::new(),
+            platform,
+        }])
     }
 }
 
@@ -426,6 +485,124 @@ mod tests {
             Ok(_) => panic!("expected not-a-dir error"),
             Err(Error::MalformedInput(msg)) => {
                 assert!(msg.contains("not a directory"), "msg: {msg}");
+            }
+            Err(other) => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// Like `build_fixture` but with `diff_ids` matched 1:1 to layers,
+    /// so `into_images` accepts the input.
+    struct AlignedFixture {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        layer1_digest: String,
+        layer2_digest: String,
+        layer1_body: Vec<u8>,
+        layer2_body: Vec<u8>,
+    }
+
+    fn build_aligned_fixture() -> AlignedFixture {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let layer1_body = b"layer-one-bytes".to_vec();
+        let layer2_body = b"second-layer-distinct-bytes".to_vec();
+        let layer1_digest = sha256_hex(&layer1_body);
+        let layer2_digest = sha256_hex(&layer2_body);
+
+        // Two diff_ids to align with the two manifest layers. The
+        // values are arbitrary — `into_images` only checks alignment,
+        // not that diff_id matches the layer body.
+        let config_body = br#"{
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": [
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+            ]},
+            "history": []
+        }"#
+        .to_vec();
+        let config_digest = sha256_hex(&config_body);
+
+        let manifest_body = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {{
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "sha256:{config_digest}",
+                    "size": {cs}
+                }},
+                "layers": [
+                    {{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:{layer1_digest}","size":{l1s}}},
+                    {{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:{layer2_digest}","size":{l2s}}}
+                ]
+            }}"#,
+            cs = config_body.len(),
+            l1s = layer1_body.len(),
+            l2s = layer2_body.len(),
+        )
+        .into_bytes();
+
+        write_file(&root.join("manifest.json"), &manifest_body);
+        write_file(&root.join(&config_digest), &config_body);
+        write_file(&root.join(&layer1_digest), &layer1_body);
+        write_file(&root.join(&layer2_digest), &layer2_body);
+
+        AlignedFixture {
+            _tmp: tmp,
+            root,
+            layer1_digest,
+            layer2_digest,
+            layer1_body,
+            layer2_body,
+        }
+    }
+
+    #[test]
+    fn into_images_yields_one_untagged_image() {
+        let fx = build_aligned_fixture();
+        let reader = DirTransportReader::open(&fx.root).unwrap();
+        let images = reader.into_images().unwrap();
+        assert_eq!(images.len(), 1);
+        let img = &images[0];
+        // Spec 01 §1.5: dir-transport carries no tags.
+        assert!(img.repo_tags.is_empty());
+        assert_eq!(img.layers.len(), 2);
+        assert_eq!(img.layers[0].digest.digest(), fx.layer1_digest);
+        assert_eq!(img.layers[1].digest.digest(), fx.layer2_digest);
+        assert_eq!(img.platform.architecture().to_string(), "amd64");
+        assert_eq!(img.platform.os().to_string(), "linux");
+    }
+
+    #[test]
+    fn into_images_layer_open_round_trips_uncompressed_layer_bytes() {
+        let fx = build_aligned_fixture();
+        let reader = DirTransportReader::open(&fx.root).unwrap();
+        let images = reader.into_images().unwrap();
+        let layers = &images[0].layers;
+
+        let mut a = Vec::new();
+        layers[0].open().unwrap().read_to_end(&mut a).unwrap();
+        assert_eq!(a, fx.layer1_body);
+        let mut b = Vec::new();
+        layers[1].open().unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(b, fx.layer2_body);
+    }
+
+    #[test]
+    fn into_images_rejects_diff_id_layer_count_mismatch() {
+        // The original `build_fixture` config has only one diff_id but
+        // its manifest names two layers — exactly the misalignment we
+        // want surfaced.
+        let fx = build_fixture();
+        let reader = DirTransportReader::open(&fx.root).unwrap();
+        match reader.into_images() {
+            Ok(_) => panic!("expected diff_id alignment error"),
+            Err(Error::MalformedInput(msg)) => {
+                assert!(msg.contains("diff_ids"), "msg: {msg}");
+                assert!(msg.contains("manifest layers"), "msg: {msg}");
             }
             Err(other) => panic!("wrong variant: {other:?}"),
         }

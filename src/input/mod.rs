@@ -11,7 +11,13 @@
 
 pub mod dir_transport;
 pub mod docker_archive;
+pub mod model;
 pub mod oci_layout;
+
+pub use dir_transport::DirTransportReader;
+pub use docker_archive::DockerArchiveReader;
+pub use model::{InputImage, LayerHandle, platform_from_config};
+pub use oci_layout::OciLayoutReader;
 
 use std::fs;
 use std::io::Read;

@@ -25,11 +25,19 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
 
-use oci_spec::image::ImageConfiguration;
+use oci_spec::image::{Digest, ImageConfiguration};
 use serde::{Deserialize, Serialize};
 
+use crate::input::model::{InputImage, LayerHandle, platform_from_config};
 use crate::{Error, Result};
+
+/// Layer media type used by `docker save`. Spec 01 §1.3 layers are
+/// always uncompressed tar; spec 02 §02.2 / `Compression::from_media_type`
+/// map this to [`crate::tar_io::compression::Compression::None`].
+const DOCKER_LAYER_MEDIA_TYPE: &str = "application/vnd.docker.image.rootfs.diff.tar";
 
 /// One entry in a Docker-archive `manifest.json`.
 ///
@@ -276,6 +284,82 @@ impl DockerArchiveReader {
         ImageConfiguration::from_reader(&*bytes)
             .map_err(|e| Error::MalformedInput(format!("cannot parse image config {}: {e}", entry.config)))
     }
+
+    /// Normalise this archive into one [`InputImage`] per `manifest.json`
+    /// entry (spec 01 §1.3 last sentence). Layer handles share an
+    /// [`Arc`]-wrapped reader so each open reopens the outer archive
+    /// (or the on-disk file, in dir form) independently — required for
+    /// the two-pass discipline in spec 02 §2.3.
+    ///
+    /// Docker-save layers are always uncompressed tar (spec 01 §1.3),
+    /// so the compressed digest equals the `diff_id` and the layer media
+    /// type is set to `application/vnd.docker.image.rootfs.diff.tar`.
+    /// Per-layer descriptor sizes are not recorded in `manifest.json`,
+    /// so the [`LayerHandle::size`] field is left as `0`; the squash
+    /// pass measures actual sizes during streaming anyway.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::MalformedInput`] if any referenced blob is missing or
+    ///   unparseable, or if the image config's `rootfs.diff_ids` length
+    ///   does not match the manifest entry's `Layers` count.
+    pub fn into_images(self) -> Result<Vec<InputImage>> {
+        // Snapshot the manifest list so the loop body owns its data;
+        // `DockerManifest: Clone` keeps this cheap.
+        let manifests = self.manifests.clone();
+        let reader = Arc::new(self);
+        let mut images = Vec::with_capacity(manifests.len());
+        for entry in &manifests {
+            images.push(build_input_image(&reader, entry)?);
+        }
+        Ok(images)
+    }
+}
+
+fn build_input_image(reader: &Arc<DockerArchiveReader>, entry: &DockerManifest) -> Result<InputImage> {
+    let config = reader.read_config(entry)?;
+
+    let diff_ids = config.rootfs().diff_ids();
+    if diff_ids.len() != entry.layers.len() {
+        return Err(Error::MalformedInput(format!(
+            "Docker image config diff_ids ({}) do not align with manifest layers ({}) for config {}",
+            diff_ids.len(),
+            entry.layers.len(),
+            entry.config,
+        )));
+    }
+
+    let layers: Vec<LayerHandle> = entry
+        .layers
+        .iter()
+        .zip(diff_ids)
+        .map(|(rel_path, diff_id_str)| {
+            let diff_id = Digest::from_str(diff_id_str).map_err(|e| {
+                Error::MalformedInput(format!("invalid diff_id `{diff_id_str}` in Docker image config: {e}"))
+            })?;
+            // Docker-save layers are uncompressed tar; the on-disk
+            // digest is therefore the diff_id and we don't have a
+            // separate descriptor digest to track.
+            let layer_digest = diff_id.clone();
+            let reader = reader.clone();
+            let path = rel_path.clone();
+            LayerHandle::new(
+                layer_digest,
+                diff_id,
+                0,
+                DOCKER_LAYER_MEDIA_TYPE.to_string(),
+                move || reader.open_blob(&path),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let platform = platform_from_config(&config);
+    Ok(InputImage {
+        config,
+        layers,
+        repo_tags: entry.repo_tags.clone(),
+        platform,
+    })
 }
 
 /// Parse a Docker-archive `manifest.json` body. A non-empty array is
@@ -656,5 +740,119 @@ mod tests {
             Err(Error::MalformedInput(msg)) => assert!(msg.contains("cannot stat"), "msg: {msg}"),
             Err(other) => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// Configs with matched `diff_id` counts: img1 has two layers, img2
+    /// has one. Used by the `into_images` tests below since the shared
+    /// `sample_config_json` only carries one `diff_id`.
+    fn config_json_with_n_diff_ids(n: usize) -> Vec<u8> {
+        let diff_ids: Vec<String> = (0..n).map(|i| format!("\"sha256:{:064x}\"", i + 1)).collect();
+        format!(
+            r#"{{
+                "architecture": "amd64",
+                "os": "linux",
+                "config": {{}},
+                "rootfs": {{"type": "layers", "diff_ids": [{}]}},
+                "history": []
+            }}"#,
+            diff_ids.join(",")
+        )
+        .into_bytes()
+    }
+
+    /// Mirror of `build_dir_fixture` but with each image's config
+    /// carrying as many `diff_ids` as the manifest names layers.
+    fn build_aligned_dir_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>, Vec<u8>) {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let layer_a = b"layer-a-tar-bytes".to_vec();
+        let layer_b = b"layer-b-tar-bytes-distinct".to_vec();
+
+        write_file(&root.join("manifest.json"), &sample_manifest_json());
+        write_file(&root.join("img1.json"), &config_json_with_n_diff_ids(2));
+        write_file(&root.join("img2.json"), &config_json_with_n_diff_ids(1));
+        write_file(&root.join("layer-a/layer.tar"), &layer_a);
+        write_file(&root.join("layer-b.tar"), &layer_b);
+
+        (tmp, root, layer_a, layer_b)
+    }
+
+    #[test]
+    fn into_images_yields_one_image_per_manifest_entry() {
+        let (_tmp, root, layer_a, layer_b) = build_aligned_dir_fixture();
+        let reader = DockerArchiveReader::open(&root).unwrap();
+        let images = reader.into_images().unwrap();
+
+        assert_eq!(images.len(), 2);
+        // img1: two layers, RepoTags carried over.
+        assert_eq!(images[0].repo_tags, vec!["example.com/img:1".to_string()]);
+        assert_eq!(images[0].layers.len(), 2);
+        // img2: one layer, untagged.
+        assert!(images[1].repo_tags.is_empty());
+        assert_eq!(images[1].layers.len(), 1);
+
+        // Layer media type matches the docker-save uncompressed type.
+        for layer in &images[0].layers {
+            assert_eq!(layer.media_type, "application/vnd.docker.image.rootfs.diff.tar");
+            assert_eq!(layer.compression, crate::tar_io::compression::Compression::None);
+        }
+
+        // Round-trip the layer body through LayerHandle::open. img1's
+        // first layer is `layer-a/layer.tar`, second is `layer-b.tar`.
+        let mut buf_a = Vec::new();
+        images[0].layers[0].open().unwrap().read_to_end(&mut buf_a).unwrap();
+        assert_eq!(buf_a, layer_a);
+
+        let mut buf_b = Vec::new();
+        images[0].layers[1].open().unwrap().read_to_end(&mut buf_b).unwrap();
+        assert_eq!(buf_b, layer_b);
+    }
+
+    #[test]
+    fn into_images_diff_id_equals_layer_digest_for_uncompressed_docker_layers() {
+        // Spec 01 §1.3 docker-save layers are uncompressed tar, so the
+        // descriptor digest equals the diff_id; the model exposes both
+        // for consistency with the OCI/dir transports.
+        let (_tmp, root, _, _) = build_aligned_dir_fixture();
+        let reader = DockerArchiveReader::open(&root).unwrap();
+        let images = reader.into_images().unwrap();
+        for img in &images {
+            for layer in &img.layers {
+                assert_eq!(layer.digest, layer.diff_id, "docker-save: digest must equal diff_id");
+            }
+        }
+    }
+
+    #[test]
+    fn into_images_rejects_diff_id_layer_count_mismatch() {
+        // Reuse the dir fixture which has the *single*-diff_id
+        // `sample_config_json` for img1's two-layer manifest entry —
+        // that's exactly the misalignment we want surfaced.
+        let fx = build_dir_fixture();
+        let reader = DockerArchiveReader::open(&fx.root).unwrap();
+        match reader.into_images() {
+            Ok(_) => panic!("expected diff_id alignment error"),
+            Err(Error::MalformedInput(msg)) => {
+                assert!(msg.contains("diff_ids"), "msg: {msg}");
+                assert!(msg.contains("manifest layers"), "msg: {msg}");
+            }
+            Err(other) => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn into_images_layer_handles_outlive_original_reader() {
+        // The Arc-wrapped reader inside each LayerHandle keeps the
+        // archive open after `into_images` consumes self. Drop the
+        // Vec<InputImage> too — only the cloned LayerHandle is left,
+        // and it must still produce a valid stream.
+        let (_tmp, root, layer_a, _) = build_aligned_dir_fixture();
+        let reader = DockerArchiveReader::open(&root).unwrap();
+        let mut images = reader.into_images().unwrap();
+        let layer = images[0].layers.remove(0);
+        drop(images);
+        let mut buf = Vec::new();
+        layer.open().unwrap().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, layer_a);
     }
 }

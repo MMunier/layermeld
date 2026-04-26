@@ -17,10 +17,18 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
 
-use oci_spec::image::{Descriptor, Digest, ImageIndex, ImageManifest, OciLayout};
+use oci_spec::image::{Descriptor, Digest, ImageConfiguration, ImageIndex, ImageManifest, OciLayout};
 
+use crate::input::model::{InputImage, LayerHandle, platform_from_config};
 use crate::{Error, Result};
+
+/// OCI manifest descriptors carry the repo tag (when known) under this
+/// annotation per the OCI image-layout spec; spec 09 §9.2 plumbs it
+/// through to the output index unchanged.
+const ANNOTATION_REF_NAME: &str = "org.opencontainers.image.ref.name";
 
 /// Reader for an on-disk OCI image layout.
 ///
@@ -285,6 +293,92 @@ impl OciLayoutReader {
         ImageManifest::from_reader(&*bytes)
             .map_err(|e| Error::MalformedInput(format!("cannot parse image manifest {}: {e}", descriptor.digest())))
     }
+
+    /// Normalise this layout into one [`InputImage`] per manifest entry
+    /// in `index.json` (spec 01 §1.1 last sentence). Layer handles
+    /// share an [`Arc`]-wrapped reader so each [`LayerHandle::open`]
+    /// reopens the underlying blob independently — required for the
+    /// two-pass discipline in spec 02 §2.3.
+    ///
+    /// `repo_tags` is populated from each manifest descriptor's
+    /// `org.opencontainers.image.ref.name` annotation (zero or one
+    /// entry, since the annotation is single-valued).
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::MalformedInput`] if any referenced blob is missing
+    ///   or unparseable, or if the image config's `rootfs.diff_ids`
+    ///   length does not match the manifest's layer count.
+    pub fn into_images(self) -> Result<Vec<InputImage>> {
+        let reader = Arc::new(self);
+        // Snapshot the descriptor list so we don't carry an immutable
+        // borrow of `reader.index()` across the loop body that builds
+        // images — `Descriptor: Clone`, so this is cheap.
+        let descriptors: Vec<Descriptor> = reader.index().manifests().clone();
+        let mut images = Vec::with_capacity(descriptors.len());
+        for descriptor in &descriptors {
+            images.push(build_input_image(&reader, descriptor)?);
+        }
+        Ok(images)
+    }
+}
+
+/// Translate one `index.json` manifest descriptor into the shared
+/// [`InputImage`] model. Pulled out of [`OciLayoutReader::into_images`]
+/// so the per-image path is isolated and easy to test.
+fn build_input_image(reader: &Arc<OciLayoutReader>, descriptor: &Descriptor) -> Result<InputImage> {
+    let manifest = reader.read_manifest(descriptor)?;
+    let cfg_bytes = reader.read_blob_to_end(manifest.config().digest())?;
+    let config = ImageConfiguration::from_reader(&*cfg_bytes).map_err(|e| {
+        Error::MalformedInput(format!(
+            "cannot parse image config {} in OCI layout: {e}",
+            manifest.config().digest(),
+        ))
+    })?;
+
+    let diff_ids = config.rootfs().diff_ids();
+    let layer_descriptors = manifest.layers();
+    if diff_ids.len() != layer_descriptors.len() {
+        return Err(Error::MalformedInput(format!(
+            "OCI image config diff_ids ({}) do not align with manifest layers ({}) for manifest {}",
+            diff_ids.len(),
+            layer_descriptors.len(),
+            descriptor.digest(),
+        )));
+    }
+
+    let layers: Vec<LayerHandle> = layer_descriptors
+        .iter()
+        .zip(diff_ids)
+        .map(|(desc, diff_id_str)| {
+            let diff_id = Digest::from_str(diff_id_str).map_err(|e| {
+                Error::MalformedInput(format!("invalid diff_id `{diff_id_str}` in OCI image config: {e}"))
+            })?;
+            let layer_digest = desc.digest().clone();
+            let media_type = desc.media_type().to_string();
+            let size = desc.size();
+            let reader = reader.clone();
+            let opener_digest = layer_digest.clone();
+            LayerHandle::new(layer_digest, diff_id, size, media_type, move || {
+                reader.open_blob(&opener_digest)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let repo_tags = descriptor
+        .annotations()
+        .as_ref()
+        .and_then(|a| a.get(ANNOTATION_REF_NAME))
+        .map(|s| vec![s.clone()])
+        .unwrap_or_default();
+
+    let platform = platform_from_config(&config);
+    Ok(InputImage {
+        config,
+        layers,
+        repo_tags,
+        platform,
+    })
 }
 
 #[cfg(test)]
@@ -350,7 +444,8 @@ mod tests {
             "architecture": "amd64",
             "os": "linux",
             "config": {},
-            "rootfs": {"type": "layers", "diff_ids": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]}
+            "rootfs": {"type": "layers", "diff_ids": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]},
+            "history": []
         }"#
         .to_vec();
         let config_digest = sha256_hex(&config_body);
@@ -631,6 +726,197 @@ mod tests {
         match OciLayoutReader::open(&missing) {
             Ok(_) => panic!("expected stat failure"),
             Err(Error::MalformedInput(msg)) => assert!(msg.contains("cannot stat"), "msg: {msg}"),
+            Err(other) => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// Build a directory-form layout that adds a `ref.name` annotation
+    /// to the index manifest descriptor and uses a gzip layer media
+    /// type. Returns the directory plus the (compressed) layer digest.
+    fn build_annotated_gzip_fixture() -> (tempfile::TempDir, PathBuf, String, Vec<u8>) {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // Gzip a synthetic layer body so `LayerHandle::open` can be
+        // exercised end-to-end: the `+gzip` media type forces the
+        // decoder, and the magic-byte cross-check needs valid gzip.
+        let plain = b"layer-plain-bytes".to_vec();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &plain).unwrap();
+        let layer_body = enc.finish().unwrap();
+        let layer_digest = sha256_hex(&layer_body);
+
+        let config_body = br#"{
+            "architecture": "arm64",
+            "os": "linux",
+            "variant": "v8",
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]},
+            "history": []
+        }"#
+        .to_vec();
+        let config_digest = sha256_hex(&config_body);
+
+        let manifest_body = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {{
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "sha256:{config_digest}",
+                    "size": {config_size}
+                }},
+                "layers": [{{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": "sha256:{layer_digest}",
+                    "size": {layer_size}
+                }}]
+            }}"#,
+            config_size = config_body.len(),
+            layer_size = layer_body.len(),
+        )
+        .into_bytes();
+        let manifest_digest = sha256_hex(&manifest_body);
+
+        let index_body = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [{{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:{manifest_digest}",
+                    "size": {manifest_size},
+                    "annotations": {{
+                        "org.opencontainers.image.ref.name": "example.com/img:tagged"
+                    }}
+                }}]
+            }}"#,
+            manifest_size = manifest_body.len(),
+        )
+        .into_bytes();
+
+        write_file(&root.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#);
+        write_file(&root.join("index.json"), &index_body);
+        write_file(&root.join(format!("blobs/sha256/{manifest_digest}")), &manifest_body);
+        write_file(&root.join(format!("blobs/sha256/{config_digest}")), &config_body);
+        write_file(&root.join(format!("blobs/sha256/{layer_digest}")), &layer_body);
+
+        (tmp, root, layer_digest, plain)
+    }
+
+    #[test]
+    fn into_images_yields_one_image_per_index_manifest() {
+        let fx = build_layout_fixture();
+        let reader = OciLayoutReader::open(&fx.root).unwrap();
+        let images = reader.into_images().unwrap();
+        assert_eq!(images.len(), 1);
+        let img = &images[0];
+        assert_eq!(img.layers.len(), 1);
+        assert_eq!(img.layers[0].digest.digest(), fx.layer_digest);
+        assert_eq!(img.layers[0].media_type, "application/vnd.oci.image.layer.v1.tar");
+        // Untagged manifest descriptor → no repo tags.
+        assert!(img.repo_tags.is_empty());
+        assert_eq!(img.platform.architecture().to_string(), "amd64");
+        assert_eq!(img.platform.os().to_string(), "linux");
+    }
+
+    #[test]
+    fn into_images_layer_open_round_trips_through_compression() {
+        // The `+gzip` media type forces the decompression path in
+        // LayerHandle::open; assert the original plain bytes come back.
+        let (_tmp, root, _layer_digest, plain) = build_annotated_gzip_fixture();
+        let reader = OciLayoutReader::open(&root).unwrap();
+        let images = reader.into_images().unwrap();
+        assert_eq!(images.len(), 1);
+        let layer = &images[0].layers[0];
+        assert_eq!(layer.compression, crate::tar_io::compression::Compression::Gzip);
+
+        let mut decoded = Vec::new();
+        layer.open().unwrap().read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn into_images_carries_ref_name_annotation_into_repo_tags() {
+        let (_tmp, root, _, _) = build_annotated_gzip_fixture();
+        let reader = OciLayoutReader::open(&root).unwrap();
+        let images = reader.into_images().unwrap();
+        assert_eq!(images[0].repo_tags, vec!["example.com/img:tagged".to_string()]);
+        // Variant from config flows through to platform.
+        assert_eq!(images[0].platform.variant().as_deref(), Some("v8"));
+    }
+
+    #[test]
+    fn into_images_layer_handles_share_reader_via_arc() {
+        // The Arc-wrapped reader inside each LayerHandle means handles
+        // outlive the original reader value (which has been moved into
+        // `into_images`). Repeatedly opening must still work.
+        let fx = build_layout_fixture();
+        let reader = OciLayoutReader::open(&fx.root).unwrap();
+        let images = reader.into_images().unwrap();
+        let layer = images[0].layers[0].clone();
+        // Drop the InputImage to confirm the layer holds its own state.
+        drop(images);
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        layer.open().unwrap().read_to_end(&mut a).unwrap();
+        layer.open().unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(a, fx.layer_body);
+        assert_eq!(b, fx.layer_body);
+    }
+
+    #[test]
+    fn into_images_rejects_diff_id_layer_count_mismatch() {
+        // Synthesise a layout where the config has 2 diff_ids but the
+        // manifest has 1 layer — `into_images` must surface this rather
+        // than build a misaligned InputImage.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let layer_body = b"x".to_vec();
+        let layer_digest = sha256_hex(&layer_body);
+        let config_body = br#"{
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": ["sha256:1111111111111111111111111111111111111111111111111111111111111111","sha256:2222222222222222222222222222222222222222222222222222222222222222"]},
+            "history": []
+        }"#
+        .to_vec();
+        let config_digest = sha256_hex(&config_body);
+        let manifest_body = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{config_digest}","size":{cs}}},
+                "layers": [{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:{layer_digest}","size":{ls}}}]
+            }}"#,
+            cs = config_body.len(),
+            ls = layer_body.len(),
+        )
+        .into_bytes();
+        let manifest_digest = sha256_hex(&manifest_body);
+        let index_body = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:{manifest_digest}","size":{ms}}}]
+            }}"#,
+            ms = manifest_body.len(),
+        )
+        .into_bytes();
+        write_file(&root.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#);
+        write_file(&root.join("index.json"), &index_body);
+        write_file(&root.join(format!("blobs/sha256/{manifest_digest}")), &manifest_body);
+        write_file(&root.join(format!("blobs/sha256/{config_digest}")), &config_body);
+        write_file(&root.join(format!("blobs/sha256/{layer_digest}")), &layer_body);
+
+        let reader = OciLayoutReader::open(&root).unwrap();
+        match reader.into_images() {
+            Ok(_) => panic!("expected diff_id mismatch error"),
+            Err(Error::MalformedInput(msg)) => {
+                assert!(msg.contains("diff_ids"), "msg: {msg}");
+                assert!(msg.contains("manifest layers"), "msg: {msg}");
+            }
             Err(other) => panic!("wrong variant: {other:?}"),
         }
     }
