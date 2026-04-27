@@ -19,7 +19,7 @@ use crate::Result;
 /// Mirrors the `EntryKind` set used by [`crate::identity`] (spec 04 §4.1)
 /// plus a `Hardlink` variant that the identity layer later collapses into
 /// `Regular` per spec 04 §4.2.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum EntryKind {
     Regular,
     Directory,
