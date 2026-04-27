@@ -281,7 +281,10 @@ pub fn effective_membership(
 /// (see `squash::apply`), so the empty path appears as
 /// `Path::ancestors()`'s terminal element on every input — filtering
 /// it out is the right thing to do uniformly.
-fn strict_ancestors(path: &Path) -> Vec<&Path> {
+///
+/// Visible to sibling dedup modules (the partition step in spec 05
+/// §5.4.2 needs the same enumeration).
+pub(super) fn strict_ancestors(path: &Path) -> Vec<&Path> {
     path.ancestors().skip(1).filter(|a| !a.as_os_str().is_empty()).collect()
 }
 
