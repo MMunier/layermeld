@@ -3,3 +3,4 @@
 pub mod dissolve;
 pub mod membership;
 pub mod partition;
+pub mod stack;
