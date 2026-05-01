@@ -2,3 +2,4 @@
 
 pub mod digest;
 pub mod emit;
+pub mod verify;
