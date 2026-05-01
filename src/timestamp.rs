@@ -129,6 +129,97 @@ impl T0 {
     pub const fn as_unix_seconds(self) -> i64 {
         self.0
     }
+
+    /// Format `T0` as an RFC 3339 / ISO 8601 timestamp in UTC.
+    ///
+    /// The output shape is fixed: `YYYY-MM-DDTHH:MM:SSZ`, four-digit
+    /// year, second precision, literal `Z` zone designator. This is
+    /// the format the OCI image-spec mandates for the `created` field
+    /// on image configs / history entries (spec 08 §8.1) and for the
+    /// `org.opencontainers.image.created` annotation on manifests and
+    /// the index (spec 08 §8.2, 8.4). All callers in the pipeline go
+    /// through this helper so the same `T0` lands byte-identically in
+    /// every emitted document — that is the spec 11 §11.6
+    /// reproducibility contract.
+    ///
+    /// # Range clamping
+    ///
+    /// RFC 3339 requires a four-digit year, which restricts the
+    /// representable range to `0001-01-01T00:00:00Z` ..=
+    /// `9999-12-31T23:59:59Z`. A `T0` outside that range is clamped
+    /// to the nearest endpoint rather than producing ill-formed
+    /// output. Spec 06 §6.6 treats absurdly far-past / far-future
+    /// timestamps as baked in unconditionally; the only adjustment
+    /// this layer makes is the format-grammar clamp, which preserves
+    /// the second-precision contract of §6.4.
+    ///
+    /// No external crate is consulted: civil-date conversion uses
+    /// Howard Hinnant's `civil_from_days` algorithm, which is exact
+    /// over the proleptic Gregorian calendar for the entire `i64`
+    /// range. The `chrono` and `time` crates are intentionally not
+    /// dependencies of this project.
+    #[must_use]
+    pub fn to_rfc3339(self) -> String {
+        let secs = self.0.clamp(MIN_RFC3339_UNIX, MAX_RFC3339_UNIX);
+        let (y, mo, d, h, mi, s) = civil_from_unix(secs);
+        format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+    }
+}
+
+/// `0001-01-01T00:00:00Z` in Unix seconds — the lower RFC 3339 bound
+/// for [`T0::to_rfc3339`].
+const MIN_RFC3339_UNIX: i64 = -62_135_596_800;
+
+/// `9999-12-31T23:59:59Z` in Unix seconds — the upper RFC 3339 bound
+/// for [`T0::to_rfc3339`].
+const MAX_RFC3339_UNIX: i64 = 253_402_300_799;
+
+/// Convert Unix seconds to a broken-down UTC `(year, month, day, hour,
+/// minute, second)` tuple. Pure arithmetic; no allocation, no calendar
+/// crate.
+///
+/// `month` and `day` are 1-based. `hour` is 0..=23, `minute` and
+/// `second` are 0..=59 (no leap seconds — Unix time itself doesn't
+/// represent them).
+fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    const SECS_PER_DAY: i64 = 86_400;
+    // Floor-division so negative `secs` (pre-1970) round toward
+    // -infinity, which is what the civil-day algorithm expects.
+    let days = secs.div_euclid(SECS_PER_DAY);
+    // `rem_euclid` for a positive divisor is in `0..SECS_PER_DAY`, so
+    // it always fits in u32.
+    let sod = u32::try_from(secs.rem_euclid(SECS_PER_DAY)).expect("rem_euclid by 86_400 is in 0..86_400");
+    let h = sod / 3600;
+    let mi = (sod % 3600) / 60;
+    let s = sod % 60;
+    let (y, mo, d) = civil_from_days(days);
+    (y, mo, d, h, mi, s)
+}
+
+/// Howard Hinnant's `civil_from_days`: days-since-1970-01-01 to
+/// `(year, month, day)` in the proleptic Gregorian calendar. Exact
+/// for any `i64` day count well past the bounds [`T0::to_rfc3339`]
+/// will ever pass in.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    // Shift epoch from 1970-03-01 (March-based to dodge leap-day
+    // arithmetic) by 719468 days. Hinnant's original uses a manual
+    // floor-divide trick because C++ `/` truncates toward zero; in
+    // Rust, `div_euclid` is already floor-division for a positive
+    // divisor, so the trick collapses to a direct call.
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    // `era * 146_097` is the largest multiple of 146 097 not exceeding
+    // `z` (floor-div property), so `z - era * 146_097` is in
+    // `0..146_097` and fits comfortably in u32.
+    let doe = u32::try_from(z - era * 146_097).expect("day-of-era is in 0..146_097");
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // 0..=399
+    let y = i64::from(yoe) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // 0..=365
+    let mp = (5 * doy + 2) / 153; // 0..=11
+    let d = doy - (153 * mp + 2) / 5 + 1; // 1..=31
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 }; // 1..=12
+    let year = if mo <= 2 { y + 1 } else { y };
+    (year, mo, d)
 }
 
 #[cfg(test)]
@@ -283,5 +374,132 @@ mod tests {
     fn t0_orders_by_seconds() {
         assert!(T0::from_unix_seconds(1) < T0::from_unix_seconds(2));
         assert!(T0::from_unix_seconds(-5) < T0::from_unix_seconds(0));
+    }
+
+    #[test]
+    fn rfc3339_unix_epoch() {
+        let s = T0::from_unix_seconds(0).to_rfc3339();
+        assert_eq!(s, "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_one_second_before_epoch() {
+        // Confirms the floor-division branch handles negative seconds
+        // correctly — naive truncation would emit
+        // "1970-01-01T-1:..." or similar nonsense.
+        let s = T0::from_unix_seconds(-1).to_rfc3339();
+        assert_eq!(s, "1969-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn rfc3339_known_recent_value() {
+        // 1700000000 unix = 2023-11-14T22:13:20Z.
+        let s = T0::from_unix_seconds(1_700_000_000).to_rfc3339();
+        assert_eq!(s, "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn rfc3339_another_known_value() {
+        // 1234567890 unix = 2009-02-13T23:31:30Z (a popular sanity
+        // check for unix-time conversions).
+        let s = T0::from_unix_seconds(1_234_567_890).to_rfc3339();
+        assert_eq!(s, "2009-02-13T23:31:30Z");
+    }
+
+    #[test]
+    fn rfc3339_leap_day_2000() {
+        // 951_782_400 = 2000-02-29T00:00:00Z. Year 2000 is a leap
+        // year (divisible by 400) — exercises the era arithmetic.
+        let s = T0::from_unix_seconds(951_782_400).to_rfc3339();
+        assert_eq!(s, "2000-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_non_leap_century_1900() {
+        // 1900-03-01T00:00:00Z = -2_203_891_200. 1900 is divisible
+        // by 100 but not 400, so it is *not* a leap year — March 1
+        // immediately follows February 28.
+        let s = T0::from_unix_seconds(-2_203_891_200).to_rfc3339();
+        assert_eq!(s, "1900-03-01T00:00:00Z");
+        let prev = T0::from_unix_seconds(-2_203_891_200 - 86_400).to_rfc3339();
+        assert_eq!(prev, "1900-02-28T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_day_boundary() {
+        let s = T0::from_unix_seconds(86_399).to_rfc3339();
+        assert_eq!(s, "1970-01-01T23:59:59Z");
+        let s = T0::from_unix_seconds(86_400).to_rfc3339();
+        assert_eq!(s, "1970-01-02T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_zero_pads_year() {
+        // 0001-01-01T00:00:00Z is the lower clamp; format must
+        // surface "0001", not "1".
+        let s = T0::from_unix_seconds(MIN_RFC3339_UNIX).to_rfc3339();
+        assert_eq!(s, "0001-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_clamps_far_past() {
+        // Anything before year 1 saturates to the lower bound.
+        let s = T0::from_unix_seconds(i64::MIN).to_rfc3339();
+        assert_eq!(s, "0001-01-01T00:00:00Z");
+        let s = T0::from_unix_seconds(MIN_RFC3339_UNIX - 1).to_rfc3339();
+        assert_eq!(s, "0001-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_clamps_far_future() {
+        // i64::MAX would otherwise overflow the four-digit year
+        // grammar; saturate to 9999-12-31T23:59:59Z.
+        let s = T0::from_unix_seconds(i64::MAX).to_rfc3339();
+        assert_eq!(s, "9999-12-31T23:59:59Z");
+        let s = T0::from_unix_seconds(MAX_RFC3339_UNIX + 1).to_rfc3339();
+        assert_eq!(s, "9999-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn rfc3339_max_bound_is_last_second_of_9999() {
+        let s = T0::from_unix_seconds(MAX_RFC3339_UNIX).to_rfc3339();
+        assert_eq!(s, "9999-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn rfc3339_fixed_width_grammar() {
+        // Format must always be 20 chars: 4+1+2+1+2+1+2+1+2+1+2+1.
+        let s = T0::from_unix_seconds(1).to_rfc3339();
+        assert_eq!(s.len(), 20);
+        assert!(s.ends_with('Z'));
+        assert_eq!(s.as_bytes()[4], b'-');
+        assert_eq!(s.as_bytes()[7], b'-');
+        assert_eq!(s.as_bytes()[10], b'T');
+        assert_eq!(s.as_bytes()[13], b':');
+        assert_eq!(s.as_bytes()[16], b':');
+    }
+
+    #[test]
+    fn rfc3339_minute_and_hour_rollover() {
+        // 3599 = 00:59:59, 3600 = 01:00:00.
+        assert_eq!(T0::from_unix_seconds(3599).to_rfc3339(), "1970-01-01T00:59:59Z");
+        assert_eq!(T0::from_unix_seconds(3600).to_rfc3339(), "1970-01-01T01:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_negative_seconds_within_day() {
+        // -86_400 = 1969-12-31T00:00:00Z. Confirms day rollover
+        // through the floor-division boundary.
+        assert_eq!(T0::from_unix_seconds(-86_400).to_rfc3339(), "1969-12-31T00:00:00Z");
+        assert_eq!(T0::from_unix_seconds(-86_401).to_rfc3339(), "1969-12-30T23:59:59Z");
+    }
+
+    #[test]
+    fn rfc3339_year_2038_boundary() {
+        // 2_147_483_647 = 2038-01-19T03:14:07Z (i32 unix-time
+        // overflow). The tool uses i64 throughout, so this is just
+        // an ordinary timestamp.
+        let s = T0::from_unix_seconds(2_147_483_647).to_rfc3339();
+        assert_eq!(s, "2038-01-19T03:14:07Z");
     }
 }
