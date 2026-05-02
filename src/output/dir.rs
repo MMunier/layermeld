@@ -37,8 +37,9 @@ use serde::Serialize;
 use crate::{Error, Result};
 
 /// Bytes of the `oci-layout` marker file (spec 09 §9.1) in canonical
-/// JSON form: a single object with one key.
-const OCI_LAYOUT_BODY: &[u8] = b"{\"imageLayoutVersion\":\"1.0.0\"}";
+/// JSON form: a single object with one key. Shared with
+/// [`super::tar`] so both packagers emit byte-identical layout markers.
+pub(super) const OCI_LAYOUT_BODY: &[u8] = b"{\"imageLayoutVersion\":\"1.0.0\"}";
 
 /// Finalise a staging directory into the user-visible output path.
 ///
@@ -71,7 +72,7 @@ pub fn finalize_layout(staging: &Path, index: &ImageIndex, output: &Path) -> Res
     fs::rename(staging, output).map_err(|e| {
         Error::Io(std::io::Error::new(
             e.kind(),
-            format!("rename {} -> {} failed: {e}", staging.display(), output.display(),),
+            format!("rename {} -> {} failed: {e}", staging.display(), output.display()),
         ))
     })?;
     if let Some(parent) = output.parent() {
@@ -110,7 +111,7 @@ fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<()> {
 /// `fsync` a directory entry on Unix-like systems so the contents land
 /// durably before `rename(2)`. Non-fatal: rename is still atomic without
 /// it; only post-crash durability weakens.
-fn sync_dir_best_effort(dir: &Path) {
+pub(super) fn sync_dir_best_effort(dir: &Path) {
     if let Ok(f) = File::open(dir) {
         let _ = f.sync_all();
     }
