@@ -13,6 +13,7 @@ pub mod dedup;
 pub mod error;
 pub mod identity;
 pub mod input;
+pub mod logging;
 pub mod oci;
 pub mod output;
 pub mod squash;
