@@ -157,7 +157,8 @@ fn parse_size(input: &str) -> std::result::Result<u64, String> {
 /// layer-size 16x` fail loudly rather than silently parsing as `16`.
 fn split_suffix(s: &str) -> std::result::Result<(&str, u64), String> {
     let bytes = s.as_bytes();
-    let last = *bytes.last()
+    let last = *bytes
+        .last()
         .ok_or_else(|| format!("size value {s:?}: unrecognized suffix (empty)"))?;
 
     let mut suffix_len = 1;
