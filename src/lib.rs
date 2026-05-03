@@ -16,9 +16,11 @@ pub mod input;
 pub mod logging;
 pub mod oci;
 pub mod output;
+pub mod run;
 pub mod squash;
 pub mod summary;
 pub mod tar_io;
 pub mod timestamp;
 
 pub use error::{Error, Result};
+pub use run::run;
