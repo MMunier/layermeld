@@ -42,8 +42,12 @@
 //!
 //! On `--dry-run` (spec 10 §10.4) steps 9–13 are skipped: no scratch
 //! tree, no output, no rename. The summary is still produced so the
-//! user can preview savings; layer sizes / digests are zero in that
-//! case because nothing was assembled.
+//! user can preview savings — per-layer sizes are sourced from
+//! [`estimated_tar_size`] (spec 05 §5.5.1's PAX-tar size estimator),
+//! which is a pure function of the candidate layer's entries and so
+//! agrees byte-for-byte with what the assembler would have produced.
+//! `diff_id`s cannot be predicted without actually streaming the
+//! bytes, so they render as a `sha256:<dry-run>` placeholder.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -57,7 +61,7 @@ use crate::assemble::emit::{EmittedLayer, emit_layers};
 use crate::assemble::verify::verify_input_digests;
 use crate::cli::Layout;
 use crate::config::Config;
-use crate::dedup::dissolve::dissolve;
+use crate::dedup::dissolve::{dissolve, estimated_tar_size};
 use crate::dedup::membership::{ImageSet, effective_membership, naive_membership};
 use crate::dedup::partition::partition;
 use crate::dedup::stack::stack_for_image;
@@ -229,7 +233,34 @@ pub fn run(config: &Config) -> Result<Summary> {
     }
 
     // Step 14 — summary.
-    Ok(build_summary(config, &images, &emitted, &artifacts, t0))
+    let layer_rows = if config.dry_run {
+        estimated_layer_rows(&layers)
+    } else {
+        emitted.iter().map(LayerSummary::from_emitted).collect()
+    };
+    Ok(build_summary(config, &images, layer_rows, &artifacts, t0))
+}
+
+/// Build the per-layer summary rows for a `--dry-run` invocation.
+///
+/// Sources sizes from [`estimated_tar_size`] (spec 05 §5.5.1's
+/// PAX-tar size estimator — the same function the dissolve pass
+/// uses), and substitutes a `sha256:<dry-run>` placeholder for the
+/// `diff_id` since the real digest cannot be computed without
+/// streaming the bytes. The iteration order is the candidate
+/// partition's lex-on-`ImageSet` order, matching what
+/// [`emit_layers`] would have produced.
+fn estimated_layer_rows(
+    layers: &std::collections::BTreeMap<ImageSet, crate::dedup::partition::CandidateLayer>,
+) -> Vec<LayerSummary> {
+    layers
+        .iter()
+        .map(|(membership, layer)| LayerSummary {
+            membership: membership.clone(),
+            size: estimated_tar_size(layer),
+            diff_id: "sha256:<dry-run>".to_string(),
+        })
+        .collect()
 }
 
 /// Per-image artifacts accumulated during step 10.
@@ -337,7 +368,7 @@ fn sha256_of(bytes: &[u8]) -> [u8; 32] {
 fn build_summary(
     config: &Config,
     images: &[InputImage],
-    emitted: &[EmittedLayer],
+    layers: Vec<LayerSummary>,
     artifacts: &[ImageArtifacts<'_>],
     t0: T0,
 ) -> Summary {
@@ -351,7 +382,6 @@ fn build_summary(
             total_bytes: img.layers.iter().map(|l| l.size).sum(),
         })
         .collect();
-    let layers: Vec<LayerSummary> = emitted.iter().map(LayerSummary::from_emitted).collect();
     let image_manifests: Vec<ImageManifestSummary> = images
         .iter()
         .enumerate()
@@ -746,7 +776,89 @@ mod tests {
         let summary = run(&cfg).unwrap();
         assert!(!output.exists(), "dry-run must not produce output");
         assert!(!td.path().join("out.tar.partial").exists());
+        assert!(!td.path().join("out.tar.staging").exists());
         assert_eq!(summary.inputs.len(), 1);
+    }
+
+    #[test]
+    fn dry_run_summary_previews_layer_sizes_from_estimate() {
+        // Spec 10 §10.4: --dry-run "reports the would-be summary so the
+        // user can preview savings". Layer rows must be populated even
+        // though no blob was assembled — sizes come from the tar-size
+        // estimator (spec 05 §5.5.1) and diff_ids carry the dry-run
+        // placeholder.
+        let td = TempDir::new().unwrap();
+        let input_root = make_dir_transport_input(&td.path().join("in"), &[("etc/hello", b"world")]);
+        let output = td.path().join("out");
+        let mut cfg = cfg_with_dir(output.clone(), vec![input_root]);
+        cfg.dry_run = true;
+
+        let summary = run(&cfg).unwrap();
+
+        assert!(!output.exists(), "dry-run must not produce output");
+        assert!(!summary.layers.is_empty(), "layer rows must populate in dry-run");
+        for layer in &summary.layers {
+            assert!(
+                layer.size > 0,
+                "estimated tar size must be non-zero for non-empty layers"
+            );
+            assert_eq!(layer.diff_id, "sha256:<dry-run>");
+        }
+        // The summary still renders end-to-end (totals + saved%
+        // computed from the estimated sizes).
+        let rendered = summary.to_string();
+        assert!(rendered.contains("inputs total (squashed):"));
+        assert!(rendered.contains("outputs total (deduplicated):"));
+    }
+
+    #[test]
+    fn dry_run_estimate_matches_real_run_layer_sizes() {
+        // The dry-run preview uses the same tar-size estimator the
+        // dissolve pass uses, which is itself a function of the same
+        // PAX header layout the assembler emits — so the previewed
+        // per-layer sizes must agree with what a real run would emit.
+        let td_a = TempDir::new().unwrap();
+        let td_b = TempDir::new().unwrap();
+        let in_a = make_dir_transport_input(&td_a.path().join("in"), &[("etc/hello", b"world")]);
+        let in_b = make_dir_transport_input(&td_b.path().join("in"), &[("etc/hello", b"world")]);
+
+        let mut dry = cfg_with_dir(td_a.path().join("out"), vec![in_a]);
+        dry.dry_run = true;
+        let dry_summary = run(&dry).unwrap();
+
+        let real = cfg_with_dir(td_b.path().join("out"), vec![in_b]);
+        let real_summary = run(&real).unwrap();
+
+        let dry_sizes: Vec<(ImageSet, u64)> = dry_summary
+            .layers
+            .iter()
+            .map(|l| (l.membership.clone(), l.size))
+            .collect();
+        let real_sizes: Vec<(ImageSet, u64)> = real_summary
+            .layers
+            .iter()
+            .map(|l| (l.membership.clone(), l.size))
+            .collect();
+        assert_eq!(dry_sizes, real_sizes);
+    }
+
+    #[test]
+    fn dry_run_skips_collision_check_and_leaves_destination_untouched() {
+        // --dry-run never writes to <output>, so it doesn't matter
+        // whether the destination already exists. Verify the existing
+        // bytes survive verbatim and no aside is created.
+        let td = TempDir::new().unwrap();
+        let input_root = make_dir_transport_input(&td.path().join("in"), &[("a", b"x")]);
+        let output = td.path().join("out.tar");
+        fs::write(&output, b"prior").unwrap();
+        let mut cfg = cfg_with_tar(output.clone(), vec![input_root]);
+        cfg.dry_run = true;
+
+        run(&cfg).unwrap();
+
+        assert_eq!(fs::read(&output).unwrap(), b"prior");
+        let aside = td.path().join(format!("out.tar.old-{}", 1_700_000_000));
+        assert!(!aside.exists(), "dry-run must not move-aside");
     }
 
     #[test]
