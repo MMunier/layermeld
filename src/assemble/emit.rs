@@ -25,10 +25,11 @@
 //! A run that aborts mid-assembly leaves no entries in the digest
 //! namespace — only a stale `.tmp-*` file the caller may sweep.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -37,8 +38,8 @@ use crate::dedup::membership::ImageSet;
 use crate::dedup::partition::CandidateLayer;
 use crate::input::model::LayerHandle;
 use crate::squash::index::SquashedEntry;
+use crate::tar_io::layer_cache::{LayerCache, build_for_layers};
 use crate::tar_io::reader::{EntryKind, EntryMeta};
-use crate::tar_io::reopen::with_entry_body;
 use crate::tar_io::writer::Writer;
 use crate::timestamp::T0;
 use crate::{Error, Result};
@@ -116,6 +117,20 @@ pub fn emit_layer(
     t0: T0,
     scratch_root: &Path,
 ) -> Result<EmittedLayer> {
+    // Single-layer entry point: build a per-call cache for just this
+    // layer's needs. The shared `emit_layers` path builds one cache
+    // covering every output layer's needs and reuses it across rayon
+    // workers — that's where the source-once decompress wins matter.
+    let cache_map = build_for_layers(&needed_sources(std::iter::once(layer)), images_layers, scratch_root)?;
+    emit_layer_with_cache(layer, &cache_map, t0, scratch_root)
+}
+
+fn emit_layer_with_cache(
+    layer: &CandidateLayer,
+    cache_map: &BTreeMap<(usize, usize), Arc<LayerCache>>,
+    t0: T0,
+    scratch_root: &Path,
+) -> Result<EmittedLayer> {
     let blobs_dir = scratch_root.join("blobs").join("sha256");
     fs::create_dir_all(&blobs_dir)?;
 
@@ -132,7 +147,7 @@ pub fn emit_layer(
         {
             let mut writer = Writer::new(&mut hashing);
             for (path, entry) in &layer.entries {
-                emit_entry(&mut writer, images_layers, path, entry, mtime)?;
+                emit_entry(&mut writer, cache_map, path, entry, mtime)?;
             }
             writer.finish()?;
         }
@@ -209,6 +224,13 @@ pub fn emit_layers(
     if layers.is_empty() {
         return Ok(Vec::new());
     }
+    // Pre-pass: decompress + index every source layer referenced by any
+    // candidate exactly once, *before* the rayon workers fan out. The
+    // cache is `Arc`-shared across workers, so a source feeding several
+    // output candidates pays the decompress cost once total — not once
+    // per output. This is the change that turns emit's body-fetch from
+    // O(N²) per layer into O(N).
+    let cache_map = build_for_layers(&needed_sources(layers.values()), images_layers, scratch_root)?;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(jobs)
         .build()
@@ -217,58 +239,60 @@ pub fn emit_layers(
     pool.install(|| {
         layer_vec
             .par_iter()
-            .map(|l| emit_layer(l, images_layers, t0, scratch_root))
+            .map(|l| emit_layer_with_cache(l, &cache_map, t0, scratch_root))
             .collect::<Result<Vec<_>>>()
     })
 }
 
+#[inline(never)]
 fn emit_entry<W: Write>(
     writer: &mut Writer<W>,
-    images_layers: &[Vec<LayerHandle>],
+    cache_map: &BTreeMap<(usize, usize), Arc<LayerCache>>,
     path: &Path,
     entry: &SquashedEntry,
     mtime: u64,
 ) -> Result<()> {
     let meta = entry_meta_for(path, entry, mtime);
     if matches!(entry.kind, EntryKind::Regular) && entry.size > 0 {
-        let layer_handle = lookup_layer(images_layers, entry)?;
-        let entry_idx = entry.entry_idx;
+        let key = (entry.image_id.0, entry.layer_idx);
+        let cache = cache_map.get(&key).ok_or_else(|| {
+            Error::Validation(format!(
+                "no LayerCache for image_id {} / layer_idx {} (cache pre-pass missed this pair)",
+                key.0, key.1,
+            ))
+        })?;
         let declared = entry.size;
-        with_entry_body(
-            || layer_handle.open(),
-            entry_idx,
-            |body_meta, body| {
-                if body_meta.size != declared {
-                    return Err(Error::Validation(format!(
-                        "body size for {} disagrees with squash record: expected {declared}, found {}",
-                        path.display(),
-                        body_meta.size,
-                    )));
-                }
-                writer.append(&meta, &mut *body)
-            },
-        )
+        cache.read_body(entry.entry_idx, |body_meta, body| {
+            if body_meta.size != declared {
+                return Err(Error::Validation(format!(
+                    "body size for {} disagrees with squash record: expected {declared}, found {}",
+                    path.display(),
+                    body_meta.size,
+                )));
+            }
+            writer.append(&meta, &mut *body)
+        })
     } else {
         writer.append(&meta, io::empty())
     }
 }
 
-fn lookup_layer<'a>(images_layers: &'a [Vec<LayerHandle>], entry: &SquashedEntry) -> Result<&'a LayerHandle> {
-    let img = images_layers.get(entry.image_id.0).ok_or_else(|| {
-        Error::Validation(format!(
-            "image_id {} out of range (have {} images)",
-            entry.image_id.0,
-            images_layers.len(),
-        ))
-    })?;
-    img.get(entry.layer_idx).ok_or_else(|| {
-        Error::Validation(format!(
-            "layer_idx {} out of range for image {} (have {} layers)",
-            entry.layer_idx,
-            entry.image_id.0,
-            img.len(),
-        ))
-    })
+/// Collect every `(image_id, layer_idx)` pair that any candidate layer
+/// in the iterator references for a regular-file body. Used by both
+/// [`emit_layer`] and [`emit_layers`] to drive the cache pre-pass.
+fn needed_sources<'a, I>(layers: I) -> BTreeSet<(usize, usize)>
+where
+    I: IntoIterator<Item = &'a CandidateLayer>,
+{
+    let mut needed = BTreeSet::new();
+    for layer in layers {
+        for entry in layer.entries.values() {
+            if matches!(entry.kind, EntryKind::Regular) && entry.size > 0 {
+                needed.insert((entry.image_id.0, entry.layer_idx));
+            }
+        }
+    }
+    needed
 }
 
 fn entry_meta_for(path: &Path, entry: &SquashedEntry, mtime: u64) -> EntryMeta {

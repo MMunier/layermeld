@@ -225,21 +225,34 @@ field needed is already in the squashed-fs index from 03.
 
 ### 5.5.2 Dissolve rule
 
-For each file `f` in a dissolved layer `M`, and for each image
-`i ∈ M`, `f` is re-emitted into the **largest existing subset layer
+For each entry `e` in a dissolved layer `M`, and for each image
+`i ∈ M`, `e` is re-emitted into the **largest existing subset layer
 `M' ⊂ M` such that `i ∈ M'` and `M'` is itself not dissolved**.
 
 If no such `M'` exists (e.g. `|M| = 2`, so the only smaller subsets
-are the singletons), `f` falls into image `i`'s per-image layer
+are the singletons), `e` falls into image `i`'s per-image layer
 `{i}`, which always exists and is never dissolved.
 
-The same file may be added to several different smaller layers —
+The same entry may be added to several different smaller layers —
 one per image in `M` — because each image needs its own path to
 the content once `M`'s shared layer is gone. The on-disk byte cost
 grows by `|M| - 1` extra copies of each dissolved file in the
 worst case (one per image of `M` minus the one that was already
 "natively" in some destination layer); the offset is the layer
 overhead saved.
+
+This applies uniformly to every entry kind, including directories.
+Non-leaf directories from the dissolved layer would also be
+recreated in the destination as a side effect of the ancestor
+back-fill in 5.5.4 once a descendant file migrates, but a **leaf**
+directory has no descendants to drag it along — explicitly
+migrating directory entries here is what keeps an empty `tmp/` (or
+any other shared leaf dir) from vanishing across the dissolve
+pass. When the destination already carries a byte-equal entry at
+the same path (the common case for dirs back-filled by partition
+pass 2), the existing entry wins per the smallest-`image_id`
+canonical-source rule from 5.4.4 — the result is byte-equal output
+either way.
 
 ### 5.5.3 Cascade order
 

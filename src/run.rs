@@ -80,7 +80,7 @@ use crate::squash::hardlink::resolve as resolve_hardlinks;
 use crate::squash::index::{InputImageId, SquashedFs};
 use crate::summary::{ImageManifestSummary, InputSummary, LayerSummary, Summary};
 use crate::timestamp::T0;
-use crate::{Error, Result};
+use crate::{Error, Result, logging};
 
 /// Run the full squash pipeline described in spec 10.
 ///
@@ -125,6 +125,7 @@ pub fn run(config: &Config) -> Result<Summary> {
     verify_input_digests(&images_layers, config.jobs)?;
 
     // Step 6 — squash + hardlink-resolve each input image.
+    tracing::info!("Squashing image file systems");
     let squashed: Vec<SquashedFs> = images
         .iter()
         .enumerate()
@@ -136,16 +137,19 @@ pub fn run(config: &Config) -> Result<Summary> {
         .collect::<Result<Vec<_>>>()?;
 
     // Step 7 — naive + effective membership, candidate-layer partition.
+    tracing::info!("Partitioning layers");
     let naive = naive_membership(&squashed);
     let eff = effective_membership(&squashed, &naive);
     let mut layers = partition(&squashed, &eff);
 
     // Step 8 — dissolve pass.
+    tracing::info!("Dissolve pass");
     dissolve(&mut layers, &squashed, config.min_layer_size);
 
     // Step 9 — set up scratch and assemble layer blobs (skipped in dry-
     // run; assembly is what produces the digests we'd want to report,
     // so the dry-run summary will report empty layer rows).
+    tracing::info!("Emitting layers");
     let scratch_root = scratch_path(config);
     let emitted: Vec<EmittedLayer> = if config.dry_run {
         Vec::new()
@@ -166,6 +170,7 @@ pub fn run(config: &Config) -> Result<Summary> {
     let mut artifacts: Vec<ImageArtifacts> = Vec::with_capacity(images.len());
     if !config.dry_run {
         for (i, img) in images.iter().enumerate() {
+            tracing::info!("Processing output image {i}");
             let stack_keys = stack_for_image(&layers, InputImageId(i));
             let stack: Vec<&EmittedLayer> = stack_keys
                 .iter()
@@ -203,6 +208,7 @@ pub fn run(config: &Config) -> Result<Summary> {
                 stack: a.stack.as_slice(),
             })
             .collect();
+        tracing::info!("Validating layout");
         validate_layout(&scratch_root, &validation_inputs)?;
     }
 
@@ -306,6 +312,7 @@ fn scratch_path(config: &Config) -> PathBuf {
 /// Load every input path, flattening multi-image archives into a single
 /// `Vec<InputImage>`. Position in the result is the [`InputImageId`].
 fn load_inputs(paths: &[PathBuf]) -> Result<Vec<InputImage>> {
+    tracing::info!("Loading images");
     let mut out: Vec<InputImage> = Vec::new();
     for path in paths {
         let mut images = load_one(path)?;

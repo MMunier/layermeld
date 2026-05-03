@@ -142,6 +142,18 @@ impl<'a, R: Read> Entry<'a, R> {
     pub fn meta(&self) -> &EntryMeta {
         &self.meta
     }
+
+    /// Byte offset of this entry's body within the stream the archive is
+    /// consuming. On a seekable, *uncompressed* tar, this is the
+    /// position from which `meta.size` bytes recover the body verbatim —
+    /// the basis for the random-access path in
+    /// [`crate::tar_io::layer_cache`].
+    ///
+    /// Forwards [`tar::Entry::raw_file_position`].
+    #[must_use]
+    pub fn raw_file_position(&self) -> u64 {
+        self.body.raw_file_position()
+    }
 }
 
 impl<R: Read> Read for Entry<'_, R> {

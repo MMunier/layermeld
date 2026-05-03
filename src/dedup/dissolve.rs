@@ -162,17 +162,19 @@ pub fn dissolve(layers: &mut BTreeMap<ImageSet, CandidateLayer>, images: &[Squas
         let entries: Vec<(PathBuf, SquashedEntry)> = layer.entries.into_iter().collect();
 
         for (path, entry) in entries {
-            // Spec 05 §5.5.2 talks about "files". Directories in this
-            // layer are duplicated copies (rule 2) — when we re-emit
-            // each file into a destination we add the ancestor dirs
-            // there anyway, so the duplicates are simply discarded
-            // here. Hardlinks per spec 05 §5.6 never live in a shared
-            // layer, so we don't expect to see them with |M| ≥ 2; if
-            // one slipped through, treat it like a file (the
-            // singleton fallback below is the spec-compliant home).
-            if matches!(entry.kind, EntryKind::Directory) {
-                continue;
-            }
+            // Every entry in the dissolved layer must end up *somewhere*
+            // — otherwise leaf directories shared across all images
+            // (the canonical example: an empty `tmp` shared by every
+            // image) would silently disappear from the output, breaking
+            // spec 11 §11.5 round-trip equality. Non-leaf directories
+            // would also be added to the destination via the ancestor-
+            // backfill in `migrate_into`, but relying on that means a
+            // directory only survives when something below it happens
+            // to migrate, so the explicit migration here is the
+            // load-bearing one. Hardlinks per spec 05 §5.6 never live
+            // in a shared layer, so we don't expect to see them with
+            // |M| ≥ 2; if one slipped through, the singleton fallback
+            // below is the spec-compliant home.
             for image_id in m.iter() {
                 let dest = pick_destination(&m, image_id, layers);
                 migrate_into(layers, &dest, &path, &entry, &by_id);
@@ -740,13 +742,16 @@ mod tests {
     }
 
     #[test]
-    fn directory_only_layer_dissolves_to_nothing() {
+    fn directory_only_layer_dissolves_into_singletons() {
         // L({0,1,2}) carrying just the shared `etc` directory (rule
         // 2 duplicate of M_D's natural layer) below threshold —
-        // should dissolve, and since there are no files to migrate,
-        // the directories are simply discarded. Smaller layers'
-        // ancestors are unaffected (they had their own copy already
-        // from partition pass 2).
+        // should dissolve. The smaller per-image layers already carry
+        // their own `etc` from partition pass 2 backfill; dissolve
+        // re-emits `etc` from the dissolved layer into each
+        // destination too, which the `Occupied` branch in
+        // `migrate_into` resolves via the smallest-`image_id`
+        // canonical-source policy. Either way the destination ends up
+        // with a byte-equal `etc` entry.
         let only0 = |i: usize| SquashedEntry {
             image_id: InputImageId(i),
             ..regular(0, 0, [0x44; 32])
@@ -774,11 +779,48 @@ mod tests {
 
         assert!(!layers.contains_key(&ids(&[0, 1, 2])), "dissolved");
         // Singletons still carry their own etc directory + file from
-        // the partition pass (unchanged).
+        // the partition pass (unchanged in shape, possibly rebound to
+        // a smaller `image_id` source by the dissolve migration).
         for (i, name) in [(0, "etc/x0"), (1, "etc/x1"), (2, "etc/x2")] {
             let l = &layers[&ids(&[i])];
             assert!(l.entries.contains_key(Path::new("etc")));
             assert!(l.entries.contains_key(Path::new(name)));
+        }
+    }
+
+    #[test]
+    fn leaf_directory_in_dissolved_layer_lands_in_per_image_destination() {
+        // Spec 11 §11.5 round-trip regression: a leaf directory shared
+        // by every image (the canonical case is an empty `tmp` dir
+        // present in every image of a corpus) used to be silently
+        // dropped by dissolve because the original implementation
+        // skipped `EntryKind::Directory` entries on the assumption
+        // that a non-leaf dir would be re-added via the
+        // file-migration ancestor-backfill. For a leaf dir nothing
+        // ever back-fills it, so the entry vanished from the output —
+        // breaking `FS(i) == FS'(i)` for every image. The fix removes
+        // the directory short-circuit so leaf dirs migrate like
+        // anything else.
+        let fs0 = fs_of(0, &[("tmp", dir(0, 0o1777))]);
+        let fs1 = fs_of(1, &[("tmp", dir(1, 0o1777))]);
+
+        let mut layers = build(&[fs0.clone(), fs1.clone()]);
+        // Partition: only L({0,1}) exists, carrying just `tmp`.
+        assert_eq!(layers.len(), 1);
+        assert!(layers.contains_key(&ids(&[0, 1])));
+
+        dissolve(&mut layers, &[fs0, fs1], DEFAULT_MIN_LAYER_SIZE);
+
+        assert!(!layers.contains_key(&ids(&[0, 1])), "dissolved");
+        // Leaf `tmp` must have landed in each per-image fallback.
+        for i in [0, 1] {
+            let l = layers
+                .get(&ids(&[i]))
+                .unwrap_or_else(|| panic!("L({{{i}}}) created on demand"));
+            assert!(
+                l.entries.contains_key(Path::new("tmp")),
+                "leaf directory `tmp` lost from L({{{i}}}) after dissolve",
+            );
         }
     }
 }
