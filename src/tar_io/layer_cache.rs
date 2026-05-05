@@ -48,8 +48,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::io::{self, Read};
+use std::os::unix::fs::FileExt;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::input::model::LayerHandle;
@@ -65,12 +66,18 @@ struct EntryRecord {
 }
 
 /// Decompressed-scratch + per-entry index for one source layer.
+///
+/// The scratch file is opened once at [`LayerCache::build`] time and
+/// kept open for the cache's lifetime. Body reads use `pread`-style
+/// positional reads ([`FileExt::read_at`]) so concurrent rayon workers
+/// can hammer the same handle without seek/read interleaving — `pread`
+/// is atomic and does not touch the file's seek position.
 #[derive(Debug)]
 pub struct LayerCache {
-    /// Path to the decompressed tar on disk. Lives under the run's
-    /// scratch root and is cleaned up with the rest of scratch (spec 07
-    /// §7.6) — the cache itself owns no cleanup logic.
-    scratch_path: PathBuf,
+    /// Open read handle on the scratch file. Shared across threads via
+    /// `&File`; `read_at` is the only access pattern, so there is no
+    /// shared-position hazard.
+    file: File,
     /// One record per `entry_idx`, matching the `enumerate()` index the
     /// squash pass assigns in [`crate::squash::apply::apply_layer`].
     /// Includes PAX/meta entries verbatim so indices line up.
@@ -118,8 +125,8 @@ impl LayerCache {
             fs::rename(&tmp, &scratch_path)?;
         }
 
-        let index = build_index(&scratch_path)?;
-        Ok(Self { scratch_path, index })
+        let (file, index) = build_index(&scratch_path)?;
+        Ok(Self { file, index })
     }
 
     /// Number of indexed entries (matches the squash pass's
@@ -158,10 +165,37 @@ impl LayerCache {
                 self.index.len()
             ))
         })?;
-        let mut file = File::open(&self.scratch_path)?;
-        file.seek(SeekFrom::Start(record.body_offset))?;
-        let mut bounded = file.take(record.body_size);
-        f(&record.meta, &mut bounded)
+        let mut reader = PositionalReader {
+            file: &self.file,
+            offset: record.body_offset,
+            remaining: record.body_size,
+        };
+        f(&record.meta, &mut reader)
+    }
+}
+
+/// `Read` adapter over a `pread`-style positional cursor on an open
+/// file. Owns no `&mut File` — concurrent calls on the same `File` are
+/// fine because [`FileExt::read_at`] does not consult or mutate the
+/// kernel's per-fd seek position.
+struct PositionalReader<'a> {
+    file: &'a File,
+    offset: u64,
+    remaining: u64,
+}
+
+impl Read for PositionalReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let cap = usize::try_from(self.remaining).unwrap_or(usize::MAX);
+        let take = buf.len().min(cap);
+        let n = self.file.read_at(&mut buf[..take], self.offset)?;
+        let n_u64 = n as u64;
+        self.offset = self.offset.saturating_add(n_u64);
+        self.remaining = self.remaining.saturating_sub(n_u64);
+        Ok(n)
     }
 }
 
@@ -169,9 +203,15 @@ impl LayerCache {
 /// entry's `(meta, body_offset, body_size)`. The body is drained to a
 /// sink so the iterator can advance to the next entry; no body bytes
 /// are retained.
-fn build_index(path: &Path) -> Result<Vec<EntryRecord>> {
-    let file = File::open(path)?;
-    let mut reader = Reader::new(file);
+///
+/// Returns the indexing handle alongside the records: the caller keeps
+/// it open for the cache's lifetime so subsequent body reads don't pay
+/// `open(2)` again. The handle used for indexing and the one used for
+/// reads are the same `File` — Linux `pread64` doesn't touch the seek
+/// position the indexer left it in, so we don't need to rewind.
+fn build_index(path: &Path) -> Result<(File, Vec<EntryRecord>)> {
+    let indexing = File::open(path)?;
+    let mut reader = Reader::new(indexing);
     let mut entries = reader.entries()?;
     let mut out = Vec::new();
     while let Some(entry) = entries.next() {
@@ -186,7 +226,13 @@ fn build_index(path: &Path) -> Result<Vec<EntryRecord>> {
             body_size,
         });
     }
-    Ok(out)
+    drop(entries);
+    // Reopen for the cache's lifetime: the `Reader` consumed the
+    // indexing handle's position and there's no API to recover the
+    // underlying `File` from `tar::Archive`. Reopening costs one extra
+    // syscall at build time and leaves us with a clean handle.
+    let read_handle = File::open(path)?;
+    Ok((read_handle, out))
 }
 
 /// Build [`LayerCache`]s for every `(image_id, layer_idx)` pair in
@@ -391,7 +437,10 @@ mod tests {
         // already present, no rewrite.
         let cache_b = LayerCache::build(&handle, scratch.path()).unwrap();
         let mtime_after = fs::metadata(&scratch_path).unwrap().modified().unwrap();
-        assert_eq!(mtime_before, mtime_after, "scratch file must not be rewritten on second build");
+        assert_eq!(
+            mtime_before, mtime_after,
+            "scratch file must not be rewritten on second build"
+        );
         assert_eq!(read_body_to_vec(&cache_b, 0), b"alpha");
     }
 

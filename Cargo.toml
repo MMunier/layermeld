@@ -36,6 +36,10 @@ oci-spec = "0.7"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# debug = "line-tables-only"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+
+[profile.dev.package.sha2]
+opt-level = 3
