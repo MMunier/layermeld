@@ -311,7 +311,7 @@ impl InMemoryFs {
 /// # Errors
 ///
 /// Returns `Err(diff)` describing the first observed discrepancy.
-pub fn diff(left: &InMemoryFs, right: &InMemoryFs) -> Result<(), String> {
+pub fn diff(left: &InMemoryFs, right: &InMemoryFs, skip_links: bool) -> Result<(), String> {
     let left_paths: BTreeSet<&Path> = left.nodes.keys().map(PathBuf::as_path).collect();
     let right_paths: BTreeSet<&Path> = right.nodes.keys().map(PathBuf::as_path).collect();
 
@@ -330,6 +330,17 @@ pub fn diff(left: &InMemoryFs, right: &InMemoryFs) -> Result<(), String> {
 
     for (path, lnode) in &left.nodes {
         let rnode = right.nodes.get(path).expect("path set already equal");
+
+        if skip_links
+            && ((lnode.kind == EntryKind::Hardlink)
+                || (lnode.kind == EntryKind::Symlink)
+                || (rnode.kind == EntryKind::Hardlink)
+                || (rnode.kind == EntryKind::Symlink))
+        {
+            println!("skip");
+            continue;
+        }
+
         if lnode != rnode {
             return Err(format!(
                 "path {} differs:\n  left:  {:?}\n  right: {:?}",

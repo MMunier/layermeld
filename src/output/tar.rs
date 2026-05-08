@@ -15,13 +15,14 @@
 //! `staging/blobs/sha256/` (deposited by [`crate::assemble::emit::emit_layers`]
 //! and the future config / manifest blob writers). Their bodies are
 //! piped straight from the staging files into the tar — no spool, no
-//! re-hash. The two top-level documents (`oci-layout`, `index.json`)
-//! are computed in-memory: the marker is a constant
-//! ([`super::dir::OCI_LAYOUT_BODY`]), the index goes through
-//! [`super::dir::canonical_json_bytes`] so its `HashMap`-backed
+//! re-hash. The three top-level documents (`oci-layout`, `index.json`,
+//! and the Docker-archive `manifest.json`) are computed in-memory: the
+//! marker is a constant ([`super::dir::OCI_LAYOUT_BODY`]), the index
+//! and the docker manifest both go through
+//! [`super::dir::canonical_json_bytes`] so their `HashMap`-backed
 //! annotation maps emit in lex key order — the same canonicalisation
 //! the dir packager uses, so a layout written either way carries
-//! byte-identical `oci-layout` and `index.json` documents.
+//! byte-identical top-level documents.
 //!
 //! ## Tar dialect (spec 09 §9.3 / spec 02 §2.4)
 //!
@@ -36,9 +37,9 @@
 //!
 //! ## Determinism (spec 11 §11.6)
 //!
-//! Entry order is fully deterministic. The four fixed paths emit in
+//! Entry order is fully deterministic. The five fixed paths emit in
 //! lex order — `blobs/`, `blobs/sha256/`, then every blob, then
-//! `index.json`, then `oci-layout`. Blob filenames inside
+//! `index.json`, `manifest.json`, `oci-layout`. Blob filenames inside
 //! `blobs/sha256/` are sorted before emission so the order of
 //! `read_dir` (filesystem-dependent) cannot leak into the tar.
 //!
@@ -61,6 +62,7 @@ use std::path::{Path, PathBuf};
 
 use oci_spec::image::ImageIndex;
 
+use crate::docker_manifest::DockerManifestEntry;
 use crate::tar_io::reader::{EntryKind, EntryMeta};
 use crate::tar_io::writer::Writer;
 use crate::timestamp::T0;
@@ -92,9 +94,16 @@ use super::dir::{OCI_LAYOUT_BODY, canonical_json_bytes, sync_dir_best_effort};
 ///   if a blob filename under `staging/blobs/sha256/` is not valid
 ///   UTF-8 (every digest the rest of the pipeline emits is lower-case
 ///   hex, so non-UTF-8 here means the staging tree was tampered with).
-pub fn finalize_tar(staging: &Path, index: &ImageIndex, output: &Path, t0: T0) -> Result<()> {
+pub fn finalize_tar(
+    staging: &Path,
+    index: &ImageIndex,
+    docker_manifest: &[DockerManifestEntry],
+    output: &Path,
+    t0: T0,
+) -> Result<()> {
     let partial = partial_path(output)?;
     let index_bytes = canonical_json_bytes(index)?;
+    let docker_bytes = canonical_json_bytes(&docker_manifest.to_vec())?;
     let blobs_dir = staging.join("blobs").join("sha256");
     let blob_names = sorted_blob_names(&blobs_dir)?;
 
@@ -107,9 +116,9 @@ pub fn finalize_tar(staging: &Path, index: &ImageIndex, output: &Path, t0: T0) -
         // Emission order is the lex order of the top-level entry paths
         // — `blobs/` < `blobs/sha256/` < every `blobs/sha256/<hex>`
         // (hex digits sort below any single-quote-or-higher byte) <
-        // `index.json` < `oci-layout`. Sorting `blob_names` above
-        // pins the per-blob order; the remaining four paths are
-        // listed in lex order by construction.
+        // `index.json` < `manifest.json` < `oci-layout`. Sorting
+        // `blob_names` above pins the per-blob order; the remaining
+        // five paths are listed in lex order by construction.
         write_dir(&mut writer, "blobs", mtime)?;
         write_dir(&mut writer, "blobs/sha256", mtime)?;
         for name in &blob_names {
@@ -127,6 +136,7 @@ pub fn finalize_tar(staging: &Path, index: &ImageIndex, output: &Path, t0: T0) -
             write_file(&mut writer, &path_str, size, f, mtime)?;
         }
         write_file_bytes(&mut writer, "index.json", &index_bytes, mtime)?;
+        write_file_bytes(&mut writer, "manifest.json", &docker_bytes, mtime)?;
         write_file_bytes(&mut writer, "oci-layout", OCI_LAYOUT_BODY, mtime)?;
         writer.finish()?;
     }
@@ -312,7 +322,7 @@ mod tests {
         let staging = make_staging(tmp.path(), &[("aa", b"alpha-blob")]);
         let output = tmp.path().join("out.tar");
 
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
 
         assert!(output.is_file(), "output must be a single file");
         // Sanity: parses back as a tar.
@@ -328,7 +338,7 @@ mod tests {
         let output = tmp.path().join("out.tar");
         let partial = tmp.path().join("out.tar.partial");
 
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
 
         assert!(output.is_file());
         assert!(!partial.exists(), "partial must be gone after rename");
@@ -343,7 +353,7 @@ mod tests {
         );
         let output = tmp.path().join("out.tar");
 
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
         let entries = read_back(&fs::read(&output).unwrap());
 
         let paths: Vec<String> = entries
@@ -372,7 +382,7 @@ mod tests {
         let staging = make_staging(tmp.path(), &[("zz", b"z"), ("aa", b"a"), ("mm", b"m"), ("bb", b"b")]);
         let output = tmp.path().join("out.tar");
 
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
         let entries = read_back(&fs::read(&output).unwrap());
         let paths: Vec<String> = entries
             .iter()
@@ -413,7 +423,7 @@ mod tests {
             &[("aa", b"\x00\x01\x02"), ("bb", b"\xff\xfe\xfd"), ("cc", b"normal")],
         );
         let output = tmp.path().join("out.tar");
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
 
         let entries = read_back(&fs::read(&output).unwrap());
         let by_path: HashMap<String, Vec<u8>> = entries
@@ -430,7 +440,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let staging = make_staging(tmp.path(), &[("aa", b"x")]);
         let output = tmp.path().join("out.tar");
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
 
         let entries = read_back(&fs::read(&output).unwrap());
         let (_, body) = entries
@@ -465,7 +475,7 @@ mod tests {
             .manifests(vec![descriptor])
             .build()
             .unwrap();
-        finalize_tar(&staging, &idx, &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &idx, &[], &output, T0::from_unix_seconds(0)).unwrap();
         let entries = read_back(&fs::read(&output).unwrap());
         let (_, body) = entries
             .iter()
@@ -487,7 +497,7 @@ mod tests {
         let staging = make_staging(tmp.path(), &[("aa", b"x"), ("bb", b"y")]);
         let output = tmp.path().join("out.tar");
         let t0 = T0::from_unix_seconds(1_700_000_000);
-        finalize_tar(&staging, &dummy_index(), &output, t0).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, t0).unwrap();
 
         let entries = read_back(&fs::read(&output).unwrap());
         for (m, _) in &entries {
@@ -503,7 +513,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let staging = make_staging(tmp.path(), &[("aa", b"x")]);
         let output = tmp.path().join("out.tar");
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(-99)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(-99)).unwrap();
         let entries = read_back(&fs::read(&output).unwrap());
         for (m, _) in &entries {
             assert_eq!(m.mtime, 0);
@@ -515,7 +525,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let staging = make_staging(tmp.path(), &[("aa", b"x")]);
         let output = tmp.path().join("out.tar");
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
         let entries = read_back(&fs::read(&output).unwrap());
         for (m, _) in &entries {
             let want = match m.kind {
@@ -532,7 +542,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let staging = make_staging(tmp.path(), &[("aa", b"x")]);
         let output = tmp.path().join("out.tar");
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
         let entries = read_back(&fs::read(&output).unwrap());
         for (m, _) in &entries {
             assert_eq!(m.uid, 0);
@@ -547,7 +557,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let staging = make_staging(tmp.path(), &[("aa", b"x")]);
         let output = tmp.path().join("out.tar");
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
         let bytes = fs::read(&output).unwrap();
         // First entry's ustar magic — `blobs/` directory header at offset 0.
         assert_eq!(&bytes[257..263], b"ustar\0", "expected ustar magic");
@@ -559,7 +569,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let staging = make_staging(tmp.path(), &[("aa", b"x")]);
         let output = tmp.path().join("out.tar");
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
         let bytes = fs::read(&output).unwrap();
         assert!(bytes.len() >= 1024);
         assert!(
@@ -575,13 +585,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let staging = make_staging(tmp.path(), &[]);
         let output = tmp.path().join("out.tar");
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
         let entries = read_back(&fs::read(&output).unwrap());
         let paths: Vec<String> = entries
             .iter()
             .map(|(m, _)| m.path.to_str().unwrap().to_string())
             .collect();
-        assert_eq!(paths, vec!["blobs/", "blobs/sha256/", "index.json", "oci-layout"]);
+        assert_eq!(
+            paths,
+            vec!["blobs/", "blobs/sha256/", "index.json", "manifest.json", "oci-layout"]
+        );
     }
 
     #[test]
@@ -594,8 +607,8 @@ mod tests {
         let out_a = tmp_a.path().join("out.tar");
         let out_b = tmp_b.path().join("out.tar");
         let t0 = T0::from_unix_seconds(42);
-        finalize_tar(&staging_a, &dummy_index(), &out_a, t0).unwrap();
-        finalize_tar(&staging_b, &dummy_index(), &out_b, t0).unwrap();
+        finalize_tar(&staging_a, &dummy_index(), &[], &out_a, t0).unwrap();
+        finalize_tar(&staging_b, &dummy_index(), &[], &out_b, t0).unwrap();
         assert_eq!(fs::read(&out_a).unwrap(), fs::read(&out_b).unwrap());
     }
 
@@ -613,7 +626,7 @@ mod tests {
         fs::create_dir_all(&output).unwrap();
         fs::write(output.join("squatter"), b"x").unwrap();
 
-        let err = finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap_err();
+        let err = finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "got: {err:?}");
         // Partial must be cleaned up so the digest namespace is left
         // tidy when the caller decides to retry.
@@ -625,7 +638,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("does-not-exist");
         let output = tmp.path().join("out.tar");
-        let err = finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap_err();
+        let err = finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "got: {err:?}");
     }
 
@@ -634,7 +647,7 @@ mod tests {
         // `/` has no file name — partial path can't be derived.
         let tmp = tempfile::tempdir().unwrap();
         let staging = make_staging(tmp.path(), &[("aa", b"x")]);
-        let err = finalize_tar(&staging, &dummy_index(), Path::new("/"), T0::from_unix_seconds(0)).unwrap_err();
+        let err = finalize_tar(&staging, &dummy_index(), &[], Path::new("/"), T0::from_unix_seconds(0)).unwrap_err();
         assert!(matches!(err, Error::Validation(_)), "got: {err:?}");
     }
 
@@ -679,7 +692,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let staging = make_staging(tmp.path(), &[("aa", b"alpha"), ("bb", b"bravo")]);
         let output = tmp.path().join("out.tar");
-        finalize_tar(&staging, &dummy_index(), &output, T0::from_unix_seconds(0)).unwrap();
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
 
         let bytes = fs::read(&output).unwrap();
         let mut reader = Reader::new(Cursor::new(bytes));
@@ -689,7 +702,62 @@ mod tests {
             let _ = e.unwrap();
             count += 1;
         }
-        // 2 dirs + 2 blobs + index.json + oci-layout = 6.
-        assert_eq!(count, 6);
+        // 2 dirs + 2 blobs + index.json + manifest.json + oci-layout = 7.
+        assert_eq!(count, 7);
+    }
+
+    #[test]
+    fn docker_manifest_lands_at_top_of_tar_as_json_array() {
+        // Spec 09 §9.5: `podman load` requires a top-level Docker
+        // `manifest.json` to restore multi-image archives. Confirm it
+        // sits in the tar at the layout root and parses back as the
+        // typed array shape.
+        use crate::docker_manifest::DockerManifestEntry;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = make_staging(tmp.path(), &[("aa", b"alpha")]);
+        let output = tmp.path().join("out.tar");
+        let docker = vec![DockerManifestEntry {
+            config: "blobs/sha256/cf".to_string(),
+            repo_tags: vec!["repo:tag".to_string()],
+            layers: vec!["blobs/sha256/aa".to_string()],
+            layer_sources: BTreeMap::new(),
+        }];
+
+        finalize_tar(&staging, &dummy_index(), &docker, &output, T0::from_unix_seconds(0)).unwrap();
+        let entries = read_back(&fs::read(&output).unwrap());
+        let (_, body) = entries
+            .iter()
+            .find(|(m, _)| m.path.to_str() == Some("manifest.json"))
+            .expect("manifest.json must be in the tar");
+        let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let arr = v.as_array().expect("docker manifest is a JSON array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["Config"], "blobs/sha256/cf");
+        assert_eq!(arr[0]["Layers"][0], "blobs/sha256/aa");
+        assert_eq!(arr[0]["RepoTags"][0], "repo:tag");
+    }
+
+    #[test]
+    fn docker_manifest_emits_in_lex_position_between_index_and_oci_layout() {
+        // Lex order of the three top-level documents pins
+        // `index.json` < `manifest.json` < `oci-layout`. Spec 11 §11.6
+        // determinism rests on this ordering — anything else would
+        // shift `oci-layout`'s offset and break byte-identical re-runs.
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = make_staging(tmp.path(), &[]);
+        let output = tmp.path().join("out.tar");
+
+        finalize_tar(&staging, &dummy_index(), &[], &output, T0::from_unix_seconds(0)).unwrap();
+        let entries = read_back(&fs::read(&output).unwrap());
+        let paths: Vec<String> = entries
+            .iter()
+            .map(|(m, _)| m.path.to_str().unwrap().to_string())
+            .collect();
+        let index_at = paths.iter().position(|p| p == "index.json").unwrap();
+        let docker_at = paths.iter().position(|p| p == "manifest.json").unwrap();
+        let layout_at = paths.iter().position(|p| p == "oci-layout").unwrap();
+        assert!(index_at < docker_at);
+        assert!(docker_at < layout_at);
     }
 }

@@ -10,6 +10,7 @@ pub mod assemble;
 pub mod cli;
 pub mod config;
 pub mod dedup;
+pub mod docker_manifest;
 pub mod error;
 pub mod identity;
 pub mod input;

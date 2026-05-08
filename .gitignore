@@ -1,3 +1,5 @@
 /target
 /hack/images
 Cargo.lock.bak
+/tmp
+/doc

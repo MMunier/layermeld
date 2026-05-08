@@ -34,6 +34,7 @@ use std::path::Path;
 use oci_spec::image::ImageIndex;
 use serde::Serialize;
 
+use crate::docker_manifest::DockerManifestEntry;
 use crate::{Error, Result};
 
 /// Bytes of the `oci-layout` marker file (spec 09 §9.1) in canonical
@@ -64,10 +65,17 @@ pub(super) const OCI_LAYOUT_BODY: &[u8] = b"{\"imageLayoutVersion\":\"1.0.0\"}";
 ///   in practice unreachable for values produced by
 ///   [`crate::oci::index::build_index`], but surfaced rather than
 ///   panicking.
-pub fn finalize_layout(staging: &Path, index: &ImageIndex, output: &Path) -> Result<()> {
+pub fn finalize_layout(
+    staging: &Path,
+    index: &ImageIndex,
+    docker_manifest: &[DockerManifestEntry],
+    output: &Path,
+) -> Result<()> {
     write_file_synced(&staging.join("oci-layout"), OCI_LAYOUT_BODY)?;
     let index_bytes = canonical_json_bytes(index)?;
     write_file_synced(&staging.join("index.json"), &index_bytes)?;
+    let docker_bytes = canonical_json_bytes(&docker_manifest.to_vec())?;
+    write_file_synced(&staging.join("manifest.json"), &docker_bytes)?;
     sync_dir_best_effort(staging);
     fs::rename(staging, output).map_err(|e| {
         Error::Io(std::io::Error::new(
@@ -119,7 +127,7 @@ pub(super) fn sync_dir_best_effort(dir: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::str::FromStr;
 
     use oci_spec::image::{
@@ -181,7 +189,7 @@ mod tests {
         let staging = make_staging(tmp.path());
         let output = tmp.path().join("out");
 
-        finalize_layout(&staging, &dummy_index(), &output).unwrap();
+        finalize_layout(&staging, &dummy_index(), &[], &output).unwrap();
 
         let body = fs::read(output.join("oci-layout")).unwrap();
         assert_eq!(body, OCI_LAYOUT_BODY);
@@ -195,7 +203,7 @@ mod tests {
         let staging = make_staging(tmp.path());
         let output = tmp.path().join("out");
 
-        finalize_layout(&staging, &dummy_index(), &output).unwrap();
+        finalize_layout(&staging, &dummy_index(), &[], &output).unwrap();
 
         let body = fs::read(output.join("index.json")).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -210,7 +218,7 @@ mod tests {
         let staging = make_staging(tmp.path());
         let output = tmp.path().join("out");
 
-        finalize_layout(&staging, &dummy_index(), &output).unwrap();
+        finalize_layout(&staging, &dummy_index(), &[], &output).unwrap();
 
         assert!(!staging.exists(), "staging must be gone after rename");
         assert!(output.is_dir(), "output must exist after rename");
@@ -230,7 +238,7 @@ mod tests {
         fs::create_dir_all(&output).unwrap();
         fs::write(output.join("squatter"), b"x").unwrap();
 
-        let err = finalize_layout(&staging, &dummy_index(), &output).unwrap_err();
+        let err = finalize_layout(&staging, &dummy_index(), &[], &output).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "got: {err:?}");
         // Staging is left in place so the caller can retry / clean up.
         assert!(staging.exists());
@@ -262,7 +270,7 @@ mod tests {
             .build()
             .unwrap();
 
-        finalize_layout(&staging, &idx, &output).unwrap();
+        finalize_layout(&staging, &idx, &[], &output).unwrap();
         let raw = fs::read_to_string(output.join("index.json")).unwrap();
         let created_at = raw.find("org.opencontainers.image.created").unwrap();
         let ref_name_at = raw.find("org.opencontainers.image.ref.name").unwrap();
@@ -283,8 +291,8 @@ mod tests {
         let out_a = tmp_a.path().join("out");
         let out_b = tmp_b.path().join("out");
 
-        finalize_layout(&staging_a, &dummy_index(), &out_a).unwrap();
-        finalize_layout(&staging_b, &dummy_index(), &out_b).unwrap();
+        finalize_layout(&staging_a, &dummy_index(), &[], &out_a).unwrap();
+        finalize_layout(&staging_b, &dummy_index(), &[], &out_b).unwrap();
 
         assert_eq!(
             fs::read(out_a.join("oci-layout")).unwrap(),
@@ -333,7 +341,7 @@ mod tests {
         fs::write(blobs.join("cc"), b"normal").unwrap();
 
         let output = tmp.path().join("out");
-        finalize_layout(&staging, &dummy_index(), &output).unwrap();
+        finalize_layout(&staging, &dummy_index(), &[], &output).unwrap();
 
         let out_blobs = output.join("blobs").join("sha256");
         assert_eq!(fs::read(out_blobs.join("aa")).unwrap(), b"\x00\x01\x02");
@@ -346,7 +354,51 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("does-not-exist");
         let output = tmp.path().join("out");
-        let err = finalize_layout(&staging, &dummy_index(), &output).unwrap_err();
+        let err = finalize_layout(&staging, &dummy_index(), &[], &output).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn writes_docker_manifest_json_when_provided() {
+        // Spec 09 §9.5: `podman load` only restores multi-image archives
+        // when a top-level Docker `manifest.json` is present. Confirm
+        // it lands at the layout root as a JSON array.
+        use crate::docker_manifest::DockerManifestEntry;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = make_staging(tmp.path());
+        let output = tmp.path().join("out");
+        let docker = vec![DockerManifestEntry {
+            config: "blobs/sha256/aa".to_string(),
+            repo_tags: vec!["repo:tag".to_string()],
+            layers: vec!["blobs/sha256/bb".to_string()],
+            layer_sources: BTreeMap::new(),
+        }];
+
+        finalize_layout(&staging, &dummy_index(), &docker, &output).unwrap();
+
+        let body = fs::read(output.join("manifest.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = v.as_array().expect("docker manifest is an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["Config"], "blobs/sha256/aa");
+        assert_eq!(arr[0]["RepoTags"][0], "repo:tag");
+        assert_eq!(arr[0]["Layers"][0], "blobs/sha256/bb");
+    }
+
+    #[test]
+    fn empty_docker_manifest_lands_as_empty_array() {
+        // The two-document contract of spec 09 §9.5 always writes
+        // `manifest.json` — an empty input set yields `[]`, not a
+        // missing file. Otherwise consumers that probe for the docker
+        // file would silently fall back to OCI semantics.
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = make_staging(tmp.path());
+        let output = tmp.path().join("out");
+
+        finalize_layout(&staging, &dummy_index(), &[], &output).unwrap();
+
+        let body = fs::read(output.join("manifest.json")).unwrap();
+        assert_eq!(body, b"[]");
     }
 }

@@ -65,6 +65,7 @@ use crate::dedup::dissolve::{dissolve, estimated_tar_size};
 use crate::dedup::membership::{ImageSet, effective_membership, naive_membership};
 use crate::dedup::partition::partition;
 use crate::dedup::stack::stack_for_image;
+use crate::docker_manifest::{DockerManifestInput, DockerManifestLayerSourceInput, build_docker_manifest};
 use crate::input::model::{InputImage, LayerHandle};
 use crate::input::{DirTransportReader, DockerArchiveReader, Layout as InputLayout, OciLayoutReader, detect};
 use crate::oci::config::rewrite_image_config;
@@ -80,7 +81,7 @@ use crate::squash::hardlink::resolve as resolve_hardlinks;
 use crate::squash::index::{InputImageId, SquashedFs};
 use crate::summary::{ImageManifestSummary, InputSummary, LayerSummary, Summary};
 use crate::timestamp::T0;
-use crate::{Error, Result, logging};
+use crate::{Error, Result};
 
 /// Run the full squash pipeline described in spec 10.
 ///
@@ -192,6 +193,7 @@ pub fn run(config: &Config) -> Result<Summary> {
             artifacts.push(ImageArtifacts {
                 stack,
                 config: new_config,
+                config_digest,
                 manifest,
                 manifest_digest,
                 manifest_size: manifest_bytes.len() as u64,
@@ -226,10 +228,49 @@ pub fn run(config: &Config) -> Result<Summary> {
             .collect();
         let index = build_index(&index_inputs, t0)?;
 
+        // Spec 09 §9.5: emit a Docker-archive `manifest.json` alongside
+        // the OCI `index.json` so `podman load -i` can restore every
+        // image (podman falls back to single-image semantics on a
+        // pure OCI layout). Layer digests come straight off the
+        // assembled stack — same blobs as the OCI manifest references,
+        // so no extra bytes land on disk.
+        let layer_digests_per_image: Vec<Vec<[u8; 32]>> = artifacts
+            .iter()
+            .map(|a| a.stack.iter().map(|l| l.digest).collect())
+            .collect();
+
+        let layer_sources_per_images: Vec<Vec<DockerManifestLayerSourceInput<'_>>> = artifacts
+            .iter()
+            .map(|a| {
+                a.stack
+                    .iter()
+                    .map(|l| DockerManifestLayerSourceInput {
+                        digest: &l.digest,
+                        media_type: "application/vnd.oci.image.layer.v1.tar",
+                        size: l.size,
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let docker_inputs: Vec<DockerManifestInput<'_>> = artifacts
+            .iter()
+            .zip(images.iter())
+            .zip(layer_digests_per_image.iter())
+            .zip(layer_sources_per_images.iter())
+            .map(|(((a, img), layers), layer_sources)| DockerManifestInput {
+                config_digest: &a.config_digest,
+                layer_digests: layers.as_slice(),
+                layer_sources: layer_sources.as_slice(),
+                repo_tags: img.repo_tags.as_slice(),
+            })
+            .collect();
+        let docker_manifest = build_docker_manifest(&docker_inputs)?;
+
         match config.layout {
-            Layout::Dir => finalize_layout(&scratch_root, &index, &config.output)?,
+            Layout::Dir => finalize_layout(&scratch_root, &index, &docker_manifest, &config.output)?,
             Layout::Tar => {
-                finalize_tar(&scratch_root, &index, &config.output, t0)?;
+                finalize_tar(&scratch_root, &index, &docker_manifest, &config.output, t0)?;
                 // Tar packaging leaves the staging directory in place
                 // (it streams blobs from there into the tar). Sweep it
                 // now so a successful run leaves only the artifact.
@@ -273,6 +314,7 @@ fn estimated_layer_rows(
 struct ImageArtifacts<'a> {
     stack: Vec<&'a EmittedLayer>,
     config: ImageConfiguration,
+    config_digest: [u8; 32],
     manifest: ImageManifest,
     manifest_digest: [u8; 32],
     manifest_size: u64,
