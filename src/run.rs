@@ -164,119 +164,18 @@ pub fn run(config: &Config) -> Result<Summary> {
     let by_membership: std::collections::BTreeMap<ImageSet, &EmittedLayer> =
         emitted.iter().map(|l| (l.membership.clone(), l)).collect();
 
-    // Step 10–11 — per-image artifact assembly. Done in a single pass
-    // so the ImageConfiguration / ImageManifest values can be carried
-    // straight into the validation gate without re-reading the blobs
-    // off disk.
-    let mut artifacts: Vec<ImageArtifacts> = Vec::with_capacity(images.len());
-    if !config.dry_run {
-        for (i, img) in images.iter().enumerate() {
-            tracing::info!("Processing output image {i}");
-            let stack_keys = stack_for_image(&layers, InputImageId(i));
-            let stack: Vec<&EmittedLayer> = stack_keys
-                .iter()
-                .map(|m| {
-                    by_membership.get(m).copied().ok_or_else(|| {
-                        Error::Validation(format!("stack references unknown layer membership {m:?} for image-{i}"))
-                    })
-                })
-                .collect::<Result<_>>()?;
-
-            let new_config = rewrite_image_config(&img.config, &stack, t0)?;
-            let config_bytes = canonical_json_bytes(&new_config)?;
-            let (config_digest, _) = write_blob_atomic(&scratch_root, &config_bytes)?;
-
-            let manifest = build_manifest(&config_digest, config_bytes.len() as u64, &stack, t0, &img.repo_tags)?;
-            let manifest_bytes = canonical_json_bytes(&manifest)?;
-            let (manifest_digest, _) = write_blob_atomic(&scratch_root, &manifest_bytes)?;
-
-            artifacts.push(ImageArtifacts {
-                stack,
-                config: new_config,
-                config_digest,
-                manifest,
-                manifest_digest,
-                manifest_size: manifest_bytes.len() as u64,
-            });
-        }
-
-        // Validation gate (spec 08 §8.5). Fails before the index is
-        // even built, so a broken pipeline never produces a layout.
-        let validation_inputs: Vec<ImageValidationInput<'_>> = artifacts
-            .iter()
-            .map(|a| ImageValidationInput {
-                manifest: &a.manifest,
-                config: &a.config,
-                stack: a.stack.as_slice(),
-            })
-            .collect();
-        tracing::info!("Validating layout");
-        validate_layout(&scratch_root, &validation_inputs)?;
-    }
+    // Step 10–11 — per-image artifact assembly + validation.
+    let artifacts: Vec<ImageArtifacts> = if config.dry_run {
+        Vec::new()
+    } else {
+        let artifacts = build_per_image_artifacts(&images, &layers, &by_membership, &scratch_root, t0)?;
+        run_validation_gate(&artifacts, &scratch_root)?;
+        artifacts
+    };
 
     // Step 12–13 — index + finalize (skipped on dry-run).
     if !config.dry_run {
-        let index_inputs: Vec<IndexEntryInput<'_>> = images
-            .iter()
-            .zip(artifacts.iter())
-            .map(|(img, a)| IndexEntryInput {
-                manifest_digest: &a.manifest_digest,
-                manifest_size: a.manifest_size,
-                config: &img.config,
-                repo_tags: img.repo_tags.as_slice(),
-            })
-            .collect();
-        let index = build_index(&index_inputs, t0)?;
-
-        // Spec 09 §9.5: emit a Docker-archive `manifest.json` alongside
-        // the OCI `index.json` so `podman load -i` can restore every
-        // image (podman falls back to single-image semantics on a
-        // pure OCI layout). Layer digests come straight off the
-        // assembled stack — same blobs as the OCI manifest references,
-        // so no extra bytes land on disk.
-        let layer_digests_per_image: Vec<Vec<[u8; 32]>> = artifacts
-            .iter()
-            .map(|a| a.stack.iter().map(|l| l.digest).collect())
-            .collect();
-
-        let layer_sources_per_images: Vec<Vec<DockerManifestLayerSourceInput<'_>>> = artifacts
-            .iter()
-            .map(|a| {
-                a.stack
-                    .iter()
-                    .map(|l| DockerManifestLayerSourceInput {
-                        digest: &l.digest,
-                        media_type: "application/vnd.oci.image.layer.v1.tar",
-                        size: l.size,
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let docker_inputs: Vec<DockerManifestInput<'_>> = artifacts
-            .iter()
-            .zip(images.iter())
-            .zip(layer_digests_per_image.iter())
-            .zip(layer_sources_per_images.iter())
-            .map(|(((a, img), layers), layer_sources)| DockerManifestInput {
-                config_digest: &a.config_digest,
-                layer_digests: layers.as_slice(),
-                layer_sources: layer_sources.as_slice(),
-                repo_tags: img.repo_tags.as_slice(),
-            })
-            .collect();
-        let docker_manifest = build_docker_manifest(&docker_inputs)?;
-
-        match config.layout {
-            Layout::Dir => finalize_layout(&scratch_root, &index, &docker_manifest, &config.output)?,
-            Layout::Tar => {
-                finalize_tar(&scratch_root, &index, &docker_manifest, &config.output, t0)?;
-                // Tar packaging leaves the staging directory in place
-                // (it streams blobs from there into the tar). Sweep it
-                // now so a successful run leaves only the artifact.
-                let _ = fs::remove_dir_all(&scratch_root);
-            }
-        }
+        finalize_output(config, &images, &artifacts, &scratch_root, t0)?;
     }
 
     // Step 14 — summary.
@@ -286,6 +185,136 @@ pub fn run(config: &Config) -> Result<Summary> {
         emitted.iter().map(LayerSummary::from_emitted).collect()
     };
     Ok(build_summary(config, &images, layer_rows, &artifacts, t0))
+}
+
+/// Build per-image artifacts (rewritten config + manifest) and write
+/// their blobs into `scratch_root` (spec 10 §10's steps 10–11).
+fn build_per_image_artifacts<'a>(
+    images: &'a [InputImage],
+    layers: &std::collections::BTreeMap<ImageSet, crate::dedup::partition::CandidateLayer>,
+    by_membership: &std::collections::BTreeMap<ImageSet, &'a EmittedLayer>,
+    scratch_root: &Path,
+    t0: T0,
+) -> Result<Vec<ImageArtifacts<'a>>> {
+    let mut artifacts: Vec<ImageArtifacts<'a>> = Vec::with_capacity(images.len());
+    for (i, img) in images.iter().enumerate() {
+        tracing::info!("Processing output image {i}");
+        let stack_keys = stack_for_image(layers, InputImageId(i));
+        let stack: Vec<&EmittedLayer> = stack_keys
+            .iter()
+            .map(|m| {
+                by_membership.get(m).copied().ok_or_else(|| {
+                    Error::Validation(format!("stack references unknown layer membership {m:?} for image-{i}"))
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        let new_config = rewrite_image_config(&img.config, &stack, t0)?;
+        let config_bytes = canonical_json_bytes(&new_config)?;
+        let (config_digest, _) = write_blob_atomic(scratch_root, &config_bytes)?;
+
+        let manifest = build_manifest(&config_digest, config_bytes.len() as u64, &stack, t0, &img.repo_tags)?;
+        let manifest_bytes = canonical_json_bytes(&manifest)?;
+        let (manifest_digest, _) = write_blob_atomic(scratch_root, &manifest_bytes)?;
+
+        artifacts.push(ImageArtifacts {
+            stack,
+            config: new_config,
+            config_digest,
+            manifest,
+            manifest_digest,
+            manifest_size: manifest_bytes.len() as u64,
+        });
+    }
+    Ok(artifacts)
+}
+
+/// Spec 08 §8.5 validation gate. Fails before the index is built so a
+/// broken pipeline never produces a layout.
+fn run_validation_gate(artifacts: &[ImageArtifacts<'_>], scratch_root: &Path) -> Result<()> {
+    let validation_inputs: Vec<ImageValidationInput<'_>> = artifacts
+        .iter()
+        .map(|a| ImageValidationInput {
+            manifest: &a.manifest,
+            config: &a.config,
+            stack: a.stack.as_slice(),
+        })
+        .collect();
+    tracing::info!("Validating layout");
+    validate_layout(scratch_root, &validation_inputs)
+}
+
+/// Build the OCI image index + Docker `manifest.json` and finalize the
+/// output layout (spec 10 §10's steps 12–13).
+fn finalize_output(
+    config: &Config,
+    images: &[InputImage],
+    artifacts: &[ImageArtifacts<'_>],
+    scratch_root: &Path,
+    t0: T0,
+) -> Result<()> {
+    let index_inputs: Vec<IndexEntryInput<'_>> = images
+        .iter()
+        .zip(artifacts.iter())
+        .map(|(img, a)| IndexEntryInput {
+            manifest_digest: &a.manifest_digest,
+            manifest_size: a.manifest_size,
+            config: &img.config,
+            repo_tags: img.repo_tags.as_slice(),
+        })
+        .collect();
+    let index = build_index(&index_inputs, t0)?;
+
+    // Spec 09 §9.5: emit a Docker-archive `manifest.json` alongside the
+    // OCI `index.json` so `podman load -i` can restore every image
+    // (podman falls back to single-image semantics on a pure OCI
+    // layout). Layer digests come straight off the assembled stack —
+    // same blobs as the OCI manifest references, so no extra bytes land
+    // on disk.
+    let layer_digests_per_image: Vec<Vec<[u8; 32]>> = artifacts
+        .iter()
+        .map(|a| a.stack.iter().map(|l| l.digest).collect())
+        .collect();
+
+    let layer_sources_per_images: Vec<Vec<DockerManifestLayerSourceInput<'_>>> = artifacts
+        .iter()
+        .map(|a| {
+            a.stack
+                .iter()
+                .map(|l| DockerManifestLayerSourceInput {
+                    digest: &l.digest,
+                    media_type: "application/vnd.oci.image.layer.v1.tar",
+                    size: l.size,
+                })
+                .collect()
+        })
+        .collect();
+
+    let docker_inputs: Vec<DockerManifestInput<'_>> = artifacts
+        .iter()
+        .zip(images.iter())
+        .zip(layer_digests_per_image.iter())
+        .zip(layer_sources_per_images.iter())
+        .map(|(((a, img), layers), layer_sources)| DockerManifestInput {
+            config_digest: &a.config_digest,
+            layer_digests: layers.as_slice(),
+            layer_sources: layer_sources.as_slice(),
+            repo_tags: img.repo_tags.as_slice(),
+        })
+        .collect();
+    let docker_manifest = build_docker_manifest(&docker_inputs)?;
+
+    match config.layout {
+        Layout::Dir => finalize_layout(scratch_root, &index, &docker_manifest, &config.output)?,
+        Layout::Tar => {
+            finalize_tar(scratch_root, &index, &docker_manifest, &config.output, t0)?;
+            // Tar packaging leaves the staging directory in place (it
+            // streams blobs from there into the tar). Sweep it now so a
+            // successful run leaves only the artifact.
+            let _ = fs::remove_dir_all(scratch_root);
+        }
+    }
+    Ok(())
 }
 
 /// Build the per-layer summary rows for a `--dry-run` invocation.

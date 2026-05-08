@@ -72,13 +72,12 @@ fn tee_to<R: Read, W: Write>(mut src: R, mut sink: W) -> Vec<u8> {
     let mut buf = [0u8; 8192];
     loop {
         match src.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(n) => {
                 captured.extend_from_slice(&buf[..n]);
                 let _ = sink.write_all(&buf[..n]);
                 let _ = sink.flush();
             }
-            Err(_) => break,
         }
     }
     captured

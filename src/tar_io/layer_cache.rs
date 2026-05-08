@@ -212,9 +212,9 @@ impl Read for PositionalReader<'_> {
 fn build_index(path: &Path) -> Result<(File, Vec<EntryRecord>)> {
     let indexing = File::open(path)?;
     let mut reader = Reader::new(indexing);
-    let mut entries = reader.entries()?;
+    let entries = reader.entries()?;
     let mut out = Vec::new();
-    while let Some(entry) = entries.next() {
+    for entry in entries {
         let mut entry = entry?;
         let body_offset = entry.raw_file_position();
         let meta = entry.meta().clone();
@@ -226,7 +226,6 @@ fn build_index(path: &Path) -> Result<(File, Vec<EntryRecord>)> {
             body_size,
         });
     }
-    drop(entries);
     // Reopen for the cache's lifetime: the `Reader` consumed the
     // indexing handle's position and there's no API to recover the
     // underlying `File` from `tar::Archive`. Reopening costs one extra
@@ -326,9 +325,9 @@ mod tests {
         .unwrap()
     }
 
-    fn handle_for_gzipped(uncompressed: Vec<u8>, diff_id_hex: &str) -> LayerHandle {
+    fn handle_for_gzipped(uncompressed: &[u8], diff_id_hex: &str) -> LayerHandle {
         let mut gz = GzEncoder::new(Vec::new(), GzCompression::fast());
-        gz.write_all(&uncompressed).unwrap();
+        gz.write_all(uncompressed).unwrap();
         let compressed = gz.finish().unwrap();
         let arc = Arc::new(compressed);
         let arc_for_open = arc.clone();
@@ -423,7 +422,7 @@ mod tests {
         let scratch = TempDir::new().unwrap();
         let tar = build_tarball(&[("a", b"alpha"), ("b", b"bravo")]);
         let diff_id_hex = "5".repeat(64);
-        let handle = handle_for_gzipped(tar, &diff_id_hex);
+        let handle = handle_for_gzipped(&tar, &diff_id_hex);
 
         let cache_a = LayerCache::build(&handle, scratch.path()).unwrap();
         assert_eq!(read_body_to_vec(&cache_a, 0), b"alpha");
@@ -501,9 +500,9 @@ mod tests {
         // Re-walk the same bytes via the public Reader and confirm
         // each enumerate-position resolves to the same path.
         let mut reader = Reader::new(Cursor::new(tar));
-        let mut entries = reader.entries().unwrap();
+        let entries = reader.entries().unwrap();
         let mut i = 0usize;
-        while let Some(entry) = entries.next() {
+        for entry in entries {
             let entry = entry.unwrap();
             cache
                 .read_body(i, |meta, _| {

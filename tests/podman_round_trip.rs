@@ -36,7 +36,7 @@ const TAG_B: &str = "18.3-trixie";
 /// that handle pulling, saving, loading, and exporting images.
 trait ContainerManager {
     /// The binary name (e.g. "podman", "docker")
-    fn binary_name(&self) -> &str;
+    fn binary_name(&self) -> &'static str;
 
     /// Check if the binary is available on PATH
     fn is_available(&self) -> bool {
@@ -99,11 +99,11 @@ trait ContainerManager {
     fn export(&self, container: &str, output: &Path);
 }
 
-/// Podman implementation of ContainerManager
+/// Podman implementation of `ContainerManager`
 struct Podman;
 
 impl ContainerManager for Podman {
-    fn binary_name(&self) -> &str {
+    fn binary_name(&self) -> &'static str {
         "podman"
     }
 
@@ -134,11 +134,11 @@ impl ContainerManager for Podman {
     }
 }
 
-/// Docker implementation of ContainerManager
+/// Docker implementation of `ContainerManager`
 struct Docker;
 
 impl ContainerManager for Docker {
-    fn binary_name(&self) -> &str {
+    fn binary_name(&self) -> &'static str {
         "docker"
     }
 
@@ -226,7 +226,7 @@ fn run_squash(inputs: &[&Path], output: &Path) {
 /// Pull the two postgres tags, save each as a separate docker-archive,
 /// merge them with the tool, reload, and verify the per-tag rootfs
 /// matches what the container manager produced for the originals.
-fn merged_postgres_images_match_originals<C: ContainerManager>(manager: C) {
+fn merged_postgres_images_match_originals<C: ContainerManager>(manager: &C) {
     if !manager.is_available() {
         eprintln!("skipping podman_round_trip: podman not in PATH");
         return;
@@ -236,7 +236,7 @@ fn merged_postgres_images_match_originals<C: ContainerManager>(manager: C) {
     let cs_a = format!("localhost/cs-test-pg17:t{pid}");
     let cs_b = format!("localhost/cs-test-pg18:t{pid}");
 
-    let mut cleanup = ContainerCleanup::new(&manager);
+    let mut cleanup = ContainerCleanup::new(manager);
     cleanup.track_image(&cs_a);
     cleanup.track_image(&cs_b);
 
@@ -266,8 +266,8 @@ fn merged_postgres_images_match_originals<C: ContainerManager>(manager: C) {
 
     let orig_fs_a = td.path().join("orig-pg17.tar");
     let orig_fs_b = td.path().join("orig-pg18.tar");
-    export_rootfs(&manager, &cs_a, &orig_fs_a, &mut cleanup);
-    export_rootfs(&manager, &cs_b, &orig_fs_b, &mut cleanup);
+    export_rootfs(manager, &cs_a, &orig_fs_a, &mut cleanup);
+    export_rootfs(manager, &cs_b, &orig_fs_b, &mut cleanup);
 
     // Drop the originals from storage so the merged load
     // reinstates each tag from the squashed bytes alone — otherwise
@@ -283,8 +283,8 @@ fn merged_postgres_images_match_originals<C: ContainerManager>(manager: C) {
 
     let merged_fs_a = td.path().join("merged-pg17.tar");
     let merged_fs_b = td.path().join("merged-pg18.tar");
-    export_rootfs(&manager, &cs_a, &merged_fs_a, &mut cleanup);
-    export_rootfs(&manager, &cs_b, &merged_fs_b, &mut cleanup);
+    export_rootfs(manager, &cs_a, &merged_fs_a, &mut cleanup);
+    export_rootfs(manager, &cs_b, &merged_fs_b, &mut cleanup);
 
     let pairs: [(&PathBuf, &PathBuf, &str); 2] = [(&orig_fs_a, &merged_fs_a, &cs_a), (&orig_fs_b, &merged_fs_b, &cs_b)];
     for (orig, merged, label) in pairs {
@@ -296,13 +296,12 @@ fn merged_postgres_images_match_originals<C: ContainerManager>(manager: C) {
     }
 }
 
-
 #[test]
 fn merged_postgres_images_match_originals_through_podman() {
-    merged_postgres_images_match_originals(Podman)
+    merged_postgres_images_match_originals(&Podman);
 }
 
 #[test]
 fn merged_postgres_images_match_originals_through_docker() {
-    merged_postgres_images_match_originals(Docker)
+    merged_postgres_images_match_originals(&Docker);
 }
