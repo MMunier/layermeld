@@ -29,6 +29,15 @@ use crate::{Error, Result};
 /// annotation per the OCI image-layout spec; spec 09 §9.2 plumbs it
 /// through to the output index unchanged.
 const ANNOTATION_REF_NAME: &str = "org.opencontainers.image.ref.name";
+/// Containerd-set annotation carrying the **full** image reference
+/// (`repo:tag` or `repo@digest`) on a manifest descriptor in
+/// `index.json`. Modern `docker save` (29+) and `podman save --format
+/// oci-archive` write this alongside the OCI-defined
+/// [`ANNOTATION_REF_NAME`], which is just the tag component (e.g.
+/// `3.20`). For docker-archive `manifest.json` `RepoTags` we need the
+/// full `repo:tag` form — `docker load` rejects bare tags as
+/// "invalid tag" — so this is preferred when present.
+const ANNOTATION_CONTAINERD_IMAGE_NAME: &str = "io.containerd.image.name";
 
 /// Reader for an on-disk OCI image layout.
 ///
@@ -365,10 +374,22 @@ fn build_input_image(reader: &Arc<OciLayoutReader>, descriptor: &Descriptor) -> 
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Prefer the containerd-set `io.containerd.image.name` annotation
+    // because it carries the full `repo:tag` form. The OCI-defined
+    // `org.opencontainers.image.ref.name` annotation only carries the
+    // tag component (e.g. `3.20`) on hybrid OCI+docker archives written
+    // by modern `docker save`, and that bare-tag form is rejected by
+    // `docker load` ("invalid tag") when echoed into the docker-archive
+    // `manifest.json`'s `RepoTags`. Fall back to `ref.name` for legacy
+    // tooling that still uses it as a full reference (the older
+    // `oci-tools`-style layouts the in-tree fixtures cover).
     let repo_tags = descriptor
         .annotations()
         .as_ref()
-        .and_then(|a| a.get(ANNOTATION_REF_NAME))
+        .and_then(|a| {
+            a.get(ANNOTATION_CONTAINERD_IMAGE_NAME)
+                .or_else(|| a.get(ANNOTATION_REF_NAME))
+        })
         .map(|s| vec![s.clone()])
         .unwrap_or_default();
 
@@ -844,6 +865,77 @@ mod tests {
         assert_eq!(images[0].repo_tags, vec!["example.com/img:tagged".to_string()]);
         // Variant from config flows through to platform.
         assert_eq!(images[0].platform.variant().as_deref(), Some("v8"));
+    }
+
+    /// Modern `docker save` (Docker 29+) writes hybrid OCI+docker
+    /// archives that set `org.opencontainers.image.ref.name` to just the
+    /// **tag component** (e.g. `3.20`) and put the full reference into
+    /// `io.containerd.image.name`. The reader must prefer the latter so
+    /// the docker-archive `manifest.json` we emit ends up with the full
+    /// `repo:tag` form `docker load` requires (bare tags are rejected
+    /// with "invalid tag").
+    #[test]
+    fn into_images_prefers_containerd_image_name_over_bare_ref_name() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let layer_body = b"x".to_vec();
+        let layer_digest = sha256_hex(&layer_body);
+        let config_body = br#"{
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]},
+            "history": []
+        }"#
+        .to_vec();
+        let config_digest = sha256_hex(&config_body);
+        let manifest_body = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {{
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "sha256:{config_digest}",
+                    "size": {config_size}
+                }},
+                "layers": [{{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": "sha256:{layer_digest}",
+                    "size": {layer_size}
+                }}]
+            }}"#,
+            config_size = config_body.len(),
+            layer_size = layer_body.len(),
+        )
+        .into_bytes();
+        let manifest_digest = sha256_hex(&manifest_body);
+        let index_body = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [{{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:{manifest_digest}",
+                    "size": {manifest_size},
+                    "annotations": {{
+                        "io.containerd.image.name": "docker.io/library/alpine:3.20",
+                        "org.opencontainers.image.ref.name": "3.20"
+                    }}
+                }}]
+            }}"#,
+            manifest_size = manifest_body.len(),
+        )
+        .into_bytes();
+
+        write_file(&root.join("oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#);
+        write_file(&root.join("index.json"), &index_body);
+        write_file(&root.join(format!("blobs/sha256/{manifest_digest}")), &manifest_body);
+        write_file(&root.join(format!("blobs/sha256/{config_digest}")), &config_body);
+        write_file(&root.join(format!("blobs/sha256/{layer_digest}")), &layer_body);
+
+        let reader = OciLayoutReader::open(&root).unwrap();
+        let images = reader.into_images().unwrap();
+        assert_eq!(images[0].repo_tags, vec!["docker.io/library/alpine:3.20".to_string()]);
     }
 
     #[test]

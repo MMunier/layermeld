@@ -258,7 +258,8 @@ fn merged_postgres_images_match_originals<C: ContainerManager>(manager: &C) {
     // `/tmp` will reject with EDQUOT. Stage under cargo's per-target
     // tmpdir so the test uses the same disk-backed area as the build
     // tree.
-    let td = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut td = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    td.disable_cleanup(true);
     let arch_a = td.path().join("pg17.tar");
     let arch_b = td.path().join("pg18.tar");
     manager.save(&cs_a, &arch_a);
@@ -290,7 +291,7 @@ fn merged_postgres_images_match_originals<C: ContainerManager>(manager: &C) {
     for (orig, merged, label) in pairs {
         let lhs = fs_from_tar(orig);
         let rhs = fs_from_tar(merged);
-        if let Err(msg) = diff(&lhs, &rhs, true) {
+        if let Err(msg) = diff(&lhs, &rhs) {
             panic!("podman round-trip diverged for {label}:\n{msg}");
         }
     }

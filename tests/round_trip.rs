@@ -165,7 +165,7 @@ fn assert_round_trip(input: &Path) {
     for (i, (lhs, rhs)) in inputs.iter().zip(outputs.iter()).enumerate() {
         let fs_in = build_fs(lhs);
         let fs_out = build_fs(rhs);
-        if let Err(msg) = diff(&fs_in, &fs_out, false) {
+        if let Err(msg) = diff(&fs_in, &fs_out) {
             panic!("round-trip diverged for image {i} of {}:\n{msg}", input.display());
         }
     }
@@ -234,7 +234,7 @@ fn synthetic_two_image_shared_layer_round_trip() {
     for (i, (lhs, rhs)) in in_imgs.iter().zip(out_imgs.iter()).enumerate() {
         let fs_in = build_fs(lhs);
         let fs_out = build_fs(rhs);
-        if let Err(msg) = diff(&fs_in, &fs_out, false) {
+        if let Err(msg) = diff(&fs_in, &fs_out) {
             panic!("round-trip diverged for image {i}:\n{msg}");
         }
     }

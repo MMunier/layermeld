@@ -140,8 +140,17 @@ fn emit_layer_with_cache(
     // Stream entries through the writer pipeline. The inner block scopes
     // the tar writer so it is dropped (its trailer flushed) before we
     // reach for the hasher.
-    // Iterate twice over the entries so that the hardlink target exists,
-    // and can be linked once the tar gets unarchived
+    //
+    // Two-pass iteration over `layer.entries` (which is BTreeMap-ordered
+    // by path): non-hardlinks first, hardlinks second. Tar extractors
+    // resolve `LNKTYPE` entries by calling `link(2)` at extraction time,
+    // which requires the target path to already exist on disk in this
+    // layer's diff. Emitting regular files (and the rest) before the
+    // hardlinks that name them satisfies that ordering even when a
+    // hardlink lex-precedes its target. `dedup::colocate` already
+    // ensured every per-image layer hardlink's target lives in the
+    // same layer and rewrote chains to point at the terminal regular,
+    // so a single ordered pass over hardlinks suffices here.
     let (digest, size, file) = {
         let file = File::create(&tmp_path)?;
         let buffered = BufWriter::new(file);
@@ -153,16 +162,9 @@ fn emit_layer_with_cache(
                     emit_entry(&mut writer, cache_map, path, entry, mtime)?;
                 }
             }
-
             for (path, entry) in &layer.entries {
                 if entry.kind == EntryKind::Hardlink {
-                    // HACK: Convert all Hardlinks into symlinks,
-                    // symlink are valid cross-layer so have the smallest size impact
-                    // Alternatively link-targets would also need to be pulled down
-                    // to the (final) layer containing the link itself
-                    let mut entry = entry.clone();
-                    entry.kind = EntryKind::Symlink;
-                    emit_entry(&mut writer, cache_map, path, &entry, mtime)?;
+                    emit_entry(&mut writer, cache_map, path, entry, mtime)?;
                 }
             }
             writer.finish()?;
@@ -583,8 +585,7 @@ mod tests {
 
         let emitted = emit_layer(&layer, &[vec![]], T0::from_unix_seconds(0), scratch.path()).unwrap();
         let read = read_back(&fs::read(&emitted.path).unwrap());
-        // assert_eq!(read[0].0.kind, EntryKind::Hardlink); // This is correct
-        assert_eq!(read[0].0.kind, EntryKind::Symlink); // This is the current workaround
+        assert_eq!(read[0].0.kind, EntryKind::Hardlink);
         assert_eq!(read[0].0.link_target.as_deref(), Some(Path::new("etc/hostname")));
     }
 

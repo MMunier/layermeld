@@ -228,14 +228,14 @@ fn diff_accepts_two_independent_runs_of_the_canonical_fixture() {
     let bytes = img.layer_tar();
     let a = InMemoryFs::apply_layers([Cursor::new(bytes.clone())]).unwrap();
     let b = InMemoryFs::apply_layers([Cursor::new(bytes)]).unwrap();
-    diff(&a, &b, false).expect("identical inputs must diff clean");
+    diff(&a, &b).expect("identical inputs must diff clean");
 }
 
 #[test]
 fn diff_reports_path_set_differences() {
     let left = InMemoryFs::apply_layers([Cursor::new(build_tar(&[file("a", b"1"), file("b", b"2")]))]).unwrap();
     let right = InMemoryFs::apply_layers([Cursor::new(build_tar(&[file("a", b"1"), file("c", b"3")]))]).unwrap();
-    let err = diff(&left, &right, false).unwrap_err();
+    let err = diff(&left, &right).unwrap_err();
     assert!(err.contains("only in left:  b"), "got: {err}");
     assert!(err.contains("only in right: c"), "got: {err}");
 }
@@ -244,7 +244,7 @@ fn diff_reports_path_set_differences() {
 fn diff_reports_per_path_metadata_differences() {
     let left = InMemoryFs::apply_layers([Cursor::new(build_tar(&[file("etc/hostname", b"a")]))]).unwrap();
     let right = InMemoryFs::apply_layers([Cursor::new(build_tar(&[file("etc/hostname", b"b")]))]).unwrap();
-    let err = diff(&left, &right, false).unwrap_err();
+    let err = diff(&left, &right).unwrap_err();
     assert!(err.contains("etc/hostname differs"), "got: {err}");
 }
 
@@ -256,7 +256,7 @@ fn diff_reports_hardlink_topology_differences() {
     let right = build_tar(&[file("etc/a", b"x"), hardlink("etc/b", "etc/a")]);
     let lf = InMemoryFs::apply_layers([Cursor::new(left)]).unwrap();
     let rf = InMemoryFs::apply_layers([Cursor::new(right)]).unwrap();
-    let err = diff(&lf, &rf, false).unwrap_err();
+    let err = diff(&lf, &rf).unwrap_err();
     assert!(err.contains("hardlink topology differs"), "got: {err}");
 }
 

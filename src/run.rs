@@ -61,6 +61,7 @@ use crate::assemble::emit::{EmittedLayer, emit_layers};
 use crate::assemble::verify::verify_input_digests;
 use crate::cli::Layout;
 use crate::config::Config;
+use crate::dedup::colocate::colocate_hardlink_targets;
 use crate::dedup::dissolve::{dissolve, estimated_tar_size};
 use crate::dedup::membership::{ImageSet, effective_membership, naive_membership};
 use crate::dedup::partition::partition;
@@ -146,6 +147,16 @@ pub fn run(config: &Config) -> Result<Summary> {
     // Step 8 — dissolve pass.
     tracing::info!("Dissolve pass");
     dissolve(&mut layers, &squashed, config.min_layer_size);
+
+    // Step 8b — co-locate each per-image layer's hardlink targets.
+    // Spec 05 §5.6 lets a hardlink in {i} reference a target that
+    // lives only in a sibling shared layer; runtimes that extract
+    // each layer tar in isolation (`podman load`, `docker load`)
+    // can't follow that cross-tar reference. Pulling the target's
+    // body into {i} costs a few KiB per image and lets hardlinks
+    // round-trip through real container loaders. Idempotent.
+    tracing::info!("Co-locating hardlink targets");
+    colocate_hardlink_targets(&mut layers, &squashed);
 
     // Step 9 — set up scratch and assemble layer blobs (skipped in dry-
     // run; assembly is what produces the digests we'd want to report,
