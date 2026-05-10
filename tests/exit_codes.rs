@@ -5,7 +5,7 @@
 //! the stdout/stderr discipline of spec 10 §10.8 is honoured (summary
 //! on stdout for success, nothing for failures).
 //!
-//! Uses `std::process::Command` against `CARGO_BIN_EXE_container-squash`
+//! Uses `std::process::Command` against `CARGO_BIN_EXE_layermeld`
 //! rather than `assert_cmd` so no extra dev-dependency is needed.
 
 use std::fmt::Write as _;
@@ -21,11 +21,11 @@ use oci_spec::image::{
 use tempfile::TempDir;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_container-squash"))
+    Command::new(env!("CARGO_BIN_EXE_layermeld"))
 }
 
 fn run(args: &[&str]) -> Output {
-    bin().args(args).output().expect("spawn container-squash")
+    bin().args(args).output().expect("spawn layermeld")
 }
 
 /// Build a minimal one-layer dir-transport image at `root`. The image
@@ -203,7 +203,7 @@ fn success_prints_summary_to_stdout_and_exits_zero() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("container-squash run summary"), "stdout: {stdout}");
+    assert!(stdout.contains("layermeld run summary"), "stdout: {stdout}");
     assert!(output.is_file());
 }
 
@@ -256,5 +256,5 @@ fn dry_run_prints_summary_but_writes_no_output() {
     assert_eq!(out.status.code(), Some(0));
     assert!(!output.exists(), "--dry-run must not produce output");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("container-squash run summary"));
+    assert!(stdout.contains("layermeld run summary"));
 }

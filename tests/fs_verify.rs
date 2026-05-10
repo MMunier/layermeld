@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use container_squash::tar_io::reader::EntryKind;
+use layermeld::tar_io::reader::EntryKind;
 use sha2::{Digest as _, Sha256};
 use tar::{Builder, EntryType, Header};
 

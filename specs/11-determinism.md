@@ -86,7 +86,7 @@ comparison.
   between runs and the upstream changed, that's outside our
   control. The tool will faithfully and deterministically produce
   a *different* output for *different* inputs.
-- **Tool version**: a different `container-squash` version may
+- **Tool version**: a different `layermeld` version may
   legitimately produce different output. The version is reported
   in the run summary.
 - **`T0`**: if neither `--timestamp` nor `SOURCE_DATE_EPOCH` is

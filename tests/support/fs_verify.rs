@@ -36,7 +36,7 @@ use std::io::{self, Read, Write as IoWrite};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use container_squash::tar_io::reader::{EntryKind, Reader};
+use layermeld::tar_io::reader::{EntryKind, Reader};
 use sha2::{Digest as _, Sha256};
 
 /// `io::Write` adapter so [`io::copy`] can stream body bytes through
@@ -351,9 +351,9 @@ pub fn diff(left: &InMemoryFs, right: &InMemoryFs) -> Result<(), String> {
     Ok(())
 }
 
-fn io_err(e: container_squash::Error) -> io::Error {
+fn io_err(e: layermeld::Error) -> io::Error {
     match e {
-        container_squash::Error::Io(inner) => inner,
+        layermeld::Error::Io(inner) => inner,
         other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
     }
 }

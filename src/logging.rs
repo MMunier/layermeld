@@ -176,9 +176,9 @@ mod tests {
         // EnvFilter accepts per-target directives — verify we hand
         // them off verbatim rather than re-parsing into a single
         // level.
-        let f = make_filter_from_env(Some("container_squash=debug,tar=warn"), 0, false);
+        let f = make_filter_from_env(Some("layermeld=debug,tar=warn"), 0, false);
         let display = format!("{f}");
-        assert!(display.contains("container_squash=debug"), "got: {display}");
+        assert!(display.contains("layermeld=debug"), "got: {display}");
         assert!(display.contains("tar=warn"), "got: {display}");
     }
 }

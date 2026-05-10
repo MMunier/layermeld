@@ -3,7 +3,7 @@
 ## 10.1 Synopsis
 
 ```
-container-squash [OPTIONS] --output <PATH> <INPUT>...
+layermeld [OPTIONS] --output <PATH> <INPUT>...
 ```
 
 The tool is a single binary with no subcommands.
@@ -68,7 +68,7 @@ On a successful run (and on `--dry-run`) the tool prints a
 human-readable summary to stdout:
 
 ```
-container-squash run summary
+layermeld run summary
   inputs:
     [0] postgres:17.9-trixie       (1 image,  N layers, M bytes)
     [1] postgres:18.3-trixie       (1 image,  N layers, M bytes)

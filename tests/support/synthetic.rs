@@ -14,7 +14,7 @@
 //!   without touching the filesystem.
 //! * [`SyntheticImage::write_dir_transport`] — a minimal `dir:`
 //!   transport image at a given root, suitable for end-to-end CLI
-//!   tests via `CARGO_BIN_EXE_container-squash`.
+//!   tests via `CARGO_BIN_EXE_layermeld`.
 //!
 //! The builder is intentionally narrow: it only knows how to produce a
 //! single-layer image. Multi-layer / multi-image scenarios are left to
@@ -27,8 +27,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use container_squash::tar_io::reader::{EntryKind, EntryMeta};
-use container_squash::tar_io::writer::Writer;
+use layermeld::tar_io::reader::{EntryKind, EntryMeta};
+use layermeld::tar_io::writer::Writer;
 use oci_spec::image::{
     Arch, ConfigBuilder, DescriptorBuilder, Digest, ImageConfigurationBuilder, ImageManifestBuilder, MediaType, Os,
     RootFsBuilder,

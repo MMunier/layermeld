@@ -1,4 +1,4 @@
-//! `container-squash` — deterministic OCI/Docker image squasher with
+//! `layermeld` — deterministic OCI/Docker image squasher with
 //! cross-image deduplication.
 //!
 //! The library exposes a single top-level entry point, [`run`], which

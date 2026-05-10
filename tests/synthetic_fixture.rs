@@ -6,14 +6,14 @@
 //!
 //! 1. The fixture covers every entry kind the writer can emit.
 //! 2. The dir-transport materialisation is parseable end-to-end —
-//!    the `container-squash` binary can squash it without erroring.
+//!    the `layermeld` binary can squash it without erroring.
 
 mod support;
 
 use std::collections::HashSet;
 use std::process::Command;
 
-use container_squash::tar_io::reader::{EntryKind, Reader};
+use layermeld::tar_io::reader::{EntryKind, Reader};
 
 use support::synthetic::SyntheticImage;
 use tempfile::TempDir;
@@ -99,7 +99,7 @@ fn dir_transport_image_is_squashable_end_to_end() {
     assert!(artifact.root.join(&artifact.config_hex).is_file());
 
     let output = td.path().join("out.tar");
-    let status = Command::new(env!("CARGO_BIN_EXE_container-squash"))
+    let status = Command::new(env!("CARGO_BIN_EXE_layermeld"))
         .args([
             "--output",
             output.to_str().unwrap(),
@@ -108,7 +108,7 @@ fn dir_transport_image_is_squashable_end_to_end() {
             input_root.to_str().unwrap(),
         ])
         .output()
-        .expect("spawn container-squash");
+        .expect("spawn layermeld");
 
     assert_eq!(
         status.status.code(),

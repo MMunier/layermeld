@@ -23,7 +23,7 @@ in 11.6.
 ## 0.2 Repository layout
 
 ```
-container-squash/
+layermeld/
 ├── Cargo.toml                 # single-crate manifest (see 0.3)
 ├── Cargo.lock                 # committed
 ├── rust-toolchain.toml        # pinned stable channel + MSRV

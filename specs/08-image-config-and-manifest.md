@@ -27,8 +27,8 @@ document, derived from the input image's config:
   - `created` = `T0`.
   - `created_by` = a short, deterministic string identifying the
     layer's role, e.g.
-    `"container-squash: shared layer for {0,1,2}"` or
-    `"container-squash: per-image layer for image-1"`. The exact
+    `"layermeld: shared layer for {0,1,2}"` or
+    `"layermeld: per-image layer for image-1"`. The exact
     text is part of the determinism contract — see 11.
   - `empty_layer` is omitted (no empty-layer history entries are
     produced).
@@ -135,4 +135,4 @@ A validation failure aborts the run; no output index is written.
   any Docker-specific fields outside the OCI image config schema.
 
 If any of these are needed downstream, the user must re-attach
-them after `container-squash` runs.
+them after `layermeld` runs.

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 
-use container_squash::input::{self, DirTransportReader, DockerArchiveReader, InputImage, Layout, OciLayoutReader};
+use layermeld::input::{self, DirTransportReader, DockerArchiveReader, InputImage, Layout, OciLayoutReader};
 use support::fs_verify::{InMemoryFs, diff};
 use support::synthetic::SyntheticImage;
 use tempfile::TempDir;
@@ -30,7 +30,7 @@ use tempfile::TempDir;
 const PINNED_T0: &str = "1700000000";
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_container-squash"))
+    Command::new(env!("CARGO_BIN_EXE_layermeld"))
 }
 
 /// Run the binary with `--layout dir` so we can read the output back via
@@ -49,7 +49,7 @@ fn run_tool_dir(inputs: &[&Path], output: &Path) -> Output {
         cmd.arg(p);
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn container-squash");
+    let mut child = cmd.spawn().expect("spawn layermeld");
 
     let child_stdout = child.stdout.take().expect("stdout piped");
     let child_stderr = child.stderr.take().expect("stderr piped");
@@ -57,7 +57,7 @@ fn run_tool_dir(inputs: &[&Path], output: &Path) -> Output {
     let stdout_thread = thread::spawn(move || tee_to(child_stdout, std::io::stdout()));
     let stderr_thread = thread::spawn(move || tee_to(child_stderr, std::io::stderr()));
 
-    let status = child.wait().expect("wait container-squash");
+    let status = child.wait().expect("wait layermeld");
     let stdout = stdout_thread.join().expect("stdout tee thread");
     let stderr = stderr_thread.join().expect("stderr tee thread");
 

@@ -171,7 +171,7 @@ impl Summary {
 
 impl fmt::Display for Summary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "container-squash run summary")?;
+        writeln!(f, "layermeld run summary")?;
 
         writeln!(f, "  inputs:")?;
         for input in &self.inputs {
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn display_contains_all_required_sections() {
         let out = fixture_summary().to_string();
-        assert!(out.starts_with("container-squash run summary"));
+        assert!(out.starts_with("layermeld run summary"));
         assert!(out.contains("inputs:"));
         assert!(out.contains("[0] postgres:17.9-trixie"));
         assert!(out.contains("[1] postgres:18.3-trixie"));
@@ -545,7 +545,7 @@ mod tests {
             t0: T0::from_unix_seconds(0),
         };
         let out = s.to_string();
-        assert!(out.contains("container-squash run summary"));
+        assert!(out.contains("layermeld run summary"));
         assert!(out.contains("T0 = 1970-01-01T00:00:00Z"));
         assert!(out.contains("inputs total (squashed):      0"));
         assert!(out.contains("outputs total (deduplicated): 0"));

@@ -1,4 +1,4 @@
-# container-squash — Project Scope
+# layermeld — Project Scope
 
 A tool that takes multiple Docker / OCI container images as input and
 produces a single combined multi-image artifact whose on-disk footprint is

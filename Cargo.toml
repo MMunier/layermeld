@@ -1,15 +1,15 @@
 [package]
-name = "container-squash"
+name = "layermeld"
 version = "0.1.0"
 edition = "2024"
 description = "Deterministic OCI/Docker image squasher with cross-image deduplication."
 
 [lib]
-name = "container_squash"
+name = "layermeld"
 path = "src/lib.rs"
 
 [[bin]]
-name = "container-squash"
+name = "layermeld"
 path = "src/main.rs"
 
 [dependencies]

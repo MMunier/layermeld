@@ -16,7 +16,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 
 use crate::dedup::dissolve::DEFAULT_MIN_LAYER_SIZE;
 
-/// Parsed command-line arguments for the `container-squash` binary.
+/// Parsed command-line arguments for the `layermeld` binary.
 ///
 /// Field semantics are described in spec 10 §10.2–10.4. The struct is
 /// intentionally a faithful reflection of argv: defaults are filled in
@@ -25,7 +25,7 @@ use crate::dedup::dissolve::DEFAULT_MIN_LAYER_SIZE;
 /// this layer.
 #[derive(Debug, Parser)]
 #[command(
-    name = "container-squash",
+    name = "layermeld",
     about = "Deterministic OCI/Docker image squasher with cross-image deduplication.",
     version,
     // Spec 10 §10.6 calls the summary out as the success-path stdout
@@ -207,7 +207,7 @@ mod tests {
     use clap::CommandFactory;
 
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
-        Cli::try_parse_from(std::iter::once("container-squash").chain(args.iter().copied()))
+        Cli::try_parse_from(std::iter::once("layermeld").chain(args.iter().copied()))
     }
 
     #[test]

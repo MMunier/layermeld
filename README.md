@@ -1,9 +1,9 @@
-# container-squash
+# layermeld
 
 A deterministic, unprivileged squasher for OCI / Docker container
 images, with cross-image deduplication.
 
-Given one or more local container images, `container-squash`
+Given one or more local container images, `layermeld`
 produces a single multi-image OCI artifact in which:
 
 - each input image has been collapsed to its final filesystem
@@ -31,19 +31,19 @@ A pinned stable Rust toolchain is declared in `rust-toolchain.toml`.
 ## Usage
 
 ```
-container-squash [OPTIONS] --output <PATH> <INPUT>...
+layermeld [OPTIONS] --output <PATH> <INPUT>...
 ```
 
 Minimal example — squash one image into a single tar:
 
 ```
-container-squash --output squashed.tar ./postgres-oci/
+layermeld --output squashed.tar ./postgres-oci/
 ```
 
 Dedup two images into one shared multi-image archive:
 
 ```
-container-squash \
+layermeld \
     --output combined.tar \
     ./postgres-17-oci/ \
     ./postgres-18-oci/
@@ -69,7 +69,7 @@ Selected flags:
 - `--dry-run` — print the would-be run summary without writing
   any output.
 
-See `container-squash --help` for the full list, and `specs/`
+See `layermeld --help` for the full list, and `specs/`
 for the full behavioural contract.
 
 ## Caveats

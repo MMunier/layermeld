@@ -214,13 +214,13 @@ fn fs_from_tar(path: &Path) -> InMemoryFs {
 }
 
 fn run_squash(inputs: &[&Path], output: &Path) {
-    let status = Command::new(env!("CARGO_BIN_EXE_container-squash"))
+    let status = Command::new(env!("CARGO_BIN_EXE_layermeld"))
         .args(["--layout", "tar", "--timestamp", PINNED_T0, "--output"])
         .arg(output)
         .args(inputs)
         .status()
-        .expect("spawn container-squash");
-    assert!(status.success(), "container-squash failed for inputs {inputs:?}");
+        .expect("spawn layermeld");
+    assert!(status.success(), "layermeld failed for inputs {inputs:?}");
 }
 
 /// Pull the two postgres tags, save each as a separate docker-archive,

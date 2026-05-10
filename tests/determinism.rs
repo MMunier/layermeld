@@ -34,7 +34,7 @@ use tempfile::TempDir;
 const PINNED_T0: &str = "1700000000";
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_container-squash"))
+    Command::new(env!("CARGO_BIN_EXE_layermeld"))
 }
 
 /// Run the binary on `inputs` with the given `--layout`, return the
@@ -46,7 +46,7 @@ fn run_tool(inputs: &[&Path], output: &Path, layout: &str) -> std::process::Outp
     for p in inputs {
         cmd.arg(p);
     }
-    cmd.output().expect("spawn container-squash")
+    cmd.output().expect("spawn layermeld")
 }
 
 /// Walk a directory tree and collect `(relative path -> bytes)` for

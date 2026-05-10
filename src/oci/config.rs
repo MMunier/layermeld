@@ -66,26 +66,26 @@ use crate::timestamp::T0;
 /// The format is part of the spec 11 determinism contract — every byte
 /// here is reproducible from the membership set alone:
 ///
-/// * `|M| == 1`: `"container-squash: per-image layer for image-<i>"`
+/// * `|M| == 1`: `"layermeld: per-image layer for image-<i>"`
 ///   where `<i>` is the input image's argv index (the `usize` inside
 ///   [`InputImageId`]).
-/// * `|M| > 1`: `"container-squash: shared layer for {<i₁>,<i₂>,...}"`
+/// * `|M| > 1`: `"layermeld: shared layer for {<i₁>,<i₂>,...}"`
 ///   with the ids in ascending order, comma-separated, no whitespace.
 ///   Ascending order falls out of [`ImageSet`]'s sorted-`Vec` backing
 ///   so callers cannot accidentally pass a reordered membership.
 ///
 /// An empty `ImageSet` is not produced by the dedup pipeline (every
 /// candidate layer has `|M| ≥ 1`); for safety, the empty case is
-/// rendered as `"container-squash: empty layer"` rather than panicking.
+/// rendered as `"layermeld: empty layer"` rather than panicking.
 #[must_use]
 pub fn created_by_for(membership: &ImageSet) -> String {
     let ids: Vec<InputImageId> = membership.iter().collect();
     match ids.as_slice() {
-        [] => "container-squash: empty layer".to_string(),
-        [single] => format!("container-squash: per-image layer for image-{}", single.0),
+        [] => "layermeld: empty layer".to_string(),
+        [single] => format!("layermeld: per-image layer for image-{}", single.0),
         many => {
             let joined = many.iter().map(|id| id.0.to_string()).collect::<Vec<_>>().join(",");
-            format!("container-squash: shared layer for {{{joined}}}")
+            format!("layermeld: shared layer for {{{joined}}}")
         }
     }
 }
@@ -233,20 +233,20 @@ mod tests {
     #[test]
     fn created_by_for_singleton_uses_per_image_form() {
         let s = created_by_for(&ImageSet::singleton(InputImageId(3)));
-        assert_eq!(s, "container-squash: per-image layer for image-3");
+        assert_eq!(s, "layermeld: per-image layer for image-3");
     }
 
     #[test]
     fn created_by_for_shared_uses_braced_csv() {
         let s = created_by_for(&ids(&[2, 0, 1]));
         // ImageSet sorts internally — the output must reflect ascending order.
-        assert_eq!(s, "container-squash: shared layer for {0,1,2}");
+        assert_eq!(s, "layermeld: shared layer for {0,1,2}");
     }
 
     #[test]
     fn created_by_for_handles_empty_set_safely() {
         let s = created_by_for(&ImageSet::new());
-        assert_eq!(s, "container-squash: empty layer");
+        assert_eq!(s, "layermeld: empty layer");
     }
 
     #[test]
@@ -330,15 +330,15 @@ mod tests {
         assert_eq!(h.len(), 3);
         assert_eq!(
             h[0].created_by().as_deref(),
-            Some("container-squash: shared layer for {0,1,2}")
+            Some("layermeld: shared layer for {0,1,2}")
         );
         assert_eq!(
             h[1].created_by().as_deref(),
-            Some("container-squash: shared layer for {0,1}")
+            Some("layermeld: shared layer for {0,1}")
         );
         assert_eq!(
             h[2].created_by().as_deref(),
-            Some("container-squash: per-image layer for image-0")
+            Some("layermeld: per-image layer for image-0")
         );
     }
 
@@ -419,7 +419,7 @@ mod tests {
         assert!(h.author().is_none());
         assert_eq!(
             h.created_by().as_deref(),
-            Some("container-squash: per-image layer for image-0")
+            Some("layermeld: per-image layer for image-0")
         );
     }
 }

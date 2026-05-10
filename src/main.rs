@@ -31,9 +31,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use container_squash::cli::Cli;
-use container_squash::config::Config;
-use container_squash::{Error, logging, run};
+use layermeld::cli::Cli;
+use layermeld::config::Config;
+use layermeld::{Error, logging, run};
 
 fn main() -> ExitCode {
     // clap handles `--help` / `--version` (exits 0) and argv-shape
