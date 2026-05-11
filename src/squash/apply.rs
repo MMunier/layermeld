@@ -131,6 +131,19 @@ pub fn apply_layer(fs: &mut SquashedFs, image_id: InputImageId, layer_idx: usize
             continue;
         }
 
+        // Hardlink targets reference another entry in the same archive,
+        // so they must live in the same normalised namespace as the
+        // paths we key on — otherwise a tar that writes `./usr/bin/perl`
+        // for the link target but `usr/bin/perl` for the file itself
+        // will fail to resolve in [`crate::squash::hardlink`]. Symlink
+        // targets are left raw: they're runtime path lookups that may
+        // be relative (`../foo`) and have no business being normalised
+        // against our index keys.
+        let link_target = match (meta.kind, meta.link_target) {
+            (EntryKind::Hardlink, Some(t)) => Some(normalise_path(&t)),
+            (_, t) => t,
+        };
+
         fs.insert(
             path,
             SquashedEntry {
@@ -144,7 +157,7 @@ pub fn apply_layer(fs: &mut SquashedFs, image_id: InputImageId, layer_idx: usize
                 size: meta.size,
                 content_hash,
                 xattrs: meta.xattrs,
-                link_target: meta.link_target,
+                link_target,
                 rdev: meta.rdev,
             },
         );
@@ -484,6 +497,23 @@ mod tests {
         let alias = fs.get(Path::new("etc/hostname.alias")).unwrap();
         assert_eq!(alias.kind, EntryKind::Hardlink);
         assert_eq!(alias.link_target.as_deref(), Some(Path::new("etc/hostname")));
+    }
+
+    #[test]
+    fn hardlink_target_is_normalised_to_match_index_keys() {
+        // Some packagers (notably bootc / certain perl builds) emit
+        // hardlinks with a `./` prefix on the target even though the
+        // referenced file itself was stored without one. Without
+        // normalisation the hardlink resolver can't find the target
+        // and rejects an otherwise-valid image.
+        let bytes = build_tar(&[
+            file("usr/bin/perl", b"#!/bin/sh\n"),
+            hardlink("usr/bin/perl5.36.0", "./usr/bin/perl"),
+        ]);
+        let fs = apply_image(InputImageId(0), &[handle_for(bytes)]).unwrap();
+        let alias = fs.get(Path::new("usr/bin/perl5.36.0")).unwrap();
+        assert_eq!(alias.kind, EntryKind::Hardlink);
+        assert_eq!(alias.link_target.as_deref(), Some(Path::new("usr/bin/perl")));
     }
 
     #[test]
