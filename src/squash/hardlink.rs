@@ -43,13 +43,19 @@ use crate::tar_io::reader::EntryKind;
 /// it to a regular file pointing at the originating body's
 /// `(image_id, layer_idx, entry_idx)` triple.
 ///
+/// `image_label` is a free-form identifier for the input image (e.g.
+/// `"input image #0 (example.com/img:1)"`) that gets embedded in error
+/// messages so the user can tell which image a malformed hardlink came
+/// from. The hardlink entry's own `layer_idx` / `entry_idx` are
+/// appended alongside.
+///
 /// # Errors
 ///
 /// * [`Error::MalformedInput`] for cycles in the hardlink graph,
 ///   hardlinks whose chain reaches a missing path, hardlinks whose
 ///   chain terminates on a non-regular kind, or `Hardlink` entries
 ///   without a `link_target`.
-pub fn resolve(fs: &mut SquashedFs) -> Result<()> {
+pub fn resolve(fs: &mut SquashedFs, image_label: &str) -> Result<()> {
     let hardlinks: Vec<PathBuf> = fs
         .iter()
         .filter(|(_, entry)| entry.kind == EntryKind::Hardlink)
@@ -57,17 +63,22 @@ pub fn resolve(fs: &mut SquashedFs) -> Result<()> {
         .collect();
 
     for path in hardlinks {
-        resolve_one(fs, &path)?;
+        resolve_one(fs, &path, image_label)?;
     }
     Ok(())
 }
 
-fn resolve_one(fs: &mut SquashedFs, path: &Path) -> Result<()> {
+fn resolve_one(fs: &mut SquashedFs, path: &Path, image_label: &str) -> Result<()> {
     let entry = fs.get(path).expect("snapshot taken from live index").clone();
-    let direct_target = entry
-        .link_target
-        .clone()
-        .ok_or_else(|| Error::MalformedInput(format!("hardlink at {} has no link_target", path.display())))?;
+    let direct_target = entry.link_target.clone().ok_or_else(|| {
+        Error::MalformedInput(format!(
+            "hardlink at {} ({}, layer {}, entry {}) has no link_target",
+            path.display(),
+            image_label,
+            entry.layer_idx,
+            entry.entry_idx
+        ))
+    })?;
 
     if fs.get(&direct_target).is_some() {
         // Direct target survives in the live view; the assemble pass
@@ -78,7 +89,7 @@ fn resolve_one(fs: &mut SquashedFs, path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let body_source = chase_to_regular(fs, &direct_target, path)?;
+    let body_source = chase_to_regular(fs, &direct_target, path, &entry, image_label)?;
     fs.insert(path.to_path_buf(), demote(body_source));
     Ok(())
 }
@@ -89,14 +100,26 @@ fn resolve_one(fs: &mut SquashedFs, path: &Path) -> Result<()> {
 /// Returns the terminal entry, which must be `EntryKind::Regular` for
 /// demotion to be meaningful. `original` is the hardlink path that
 /// triggered the chase, used purely for error messages.
-fn chase_to_regular(fs: &SquashedFs, start: &Path, original: &Path) -> Result<SquashedEntry> {
+fn chase_to_regular(
+    fs: &SquashedFs,
+    start: &Path,
+    original: &Path,
+    original_entry: &SquashedEntry,
+    image_label: &str,
+) -> Result<SquashedEntry> {
+    let origin = format!(
+        "hardlink at {} ({}, layer {}, entry {})",
+        original.display(),
+        image_label,
+        original_entry.layer_idx,
+        original_entry.entry_idx
+    );
     let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
     let mut cursor = start.to_path_buf();
     loop {
         if !visited.insert(cursor.clone()) {
             return Err(Error::MalformedInput(format!(
-                "hardlink at {} resolves through a cycle (revisited {})",
-                original.display(),
+                "{origin} resolves through a cycle (revisited {})",
                 cursor.display()
             )));
         }
@@ -109,23 +132,29 @@ fn chase_to_regular(fs: &SquashedFs, start: &Path, original: &Path) -> Result<Sq
             .cloned()
             .ok_or_else(|| {
                 Error::MalformedInput(format!(
-                    "hardlink at {} chain reaches missing path {}",
-                    original.display(),
+                    "{origin} chain reaches missing path {}",
                     cursor.display()
                 ))
             })?;
         match entry.kind {
             EntryKind::Hardlink => {
                 cursor = entry.link_target.clone().ok_or_else(|| {
-                    Error::MalformedInput(format!("hardlink at {} has no link_target", cursor.display()))
+                    Error::MalformedInput(format!(
+                        "{origin} chain hop {} (layer {}, entry {}) has no link_target",
+                        cursor.display(),
+                        entry.layer_idx,
+                        entry.entry_idx
+                    ))
                 })?;
             }
             EntryKind::Regular => return Ok(entry),
             other => {
                 return Err(Error::MalformedInput(format!(
-                    "hardlink at {} chain ends in non-regular kind {:?}",
-                    original.display(),
-                    other
+                    "{origin} chain ends at {} on non-regular kind {:?} (layer {}, entry {})",
+                    cursor.display(),
+                    other,
+                    entry.layer_idx,
+                    entry.entry_idx
                 )));
             }
         }
@@ -187,7 +216,7 @@ mod tests {
     #[test]
     fn empty_index_is_a_noop() {
         let mut fs = SquashedFs::new();
-        resolve(&mut fs).unwrap();
+        resolve(&mut fs, "test image").unwrap();
         assert!(fs.is_empty());
     }
 
@@ -196,7 +225,7 @@ mod tests {
         let mut fs = SquashedFs::new();
         fs.insert(PathBuf::from("etc/hostname"), regular(0, 0, 12));
         fs.insert(PathBuf::from("etc/hostname.alias"), hardlink(0, 1, "etc/hostname"));
-        resolve(&mut fs).unwrap();
+        resolve(&mut fs, "test image").unwrap();
         let alias = fs.get(Path::new("etc/hostname.alias")).unwrap();
         // Still a hardlink — direct target is alive in the index.
         assert_eq!(alias.kind, EntryKind::Hardlink);
@@ -216,7 +245,7 @@ mod tests {
         assert!(!fs.contains(Path::new("etc/hostname")));
         assert!(fs.shadow_get(Path::new("etc/hostname")).is_some());
 
-        resolve(&mut fs).unwrap();
+        resolve(&mut fs, "test image").unwrap();
 
         let demoted = fs.get(Path::new("etc/hostname.alias")).unwrap();
         assert_eq!(demoted.kind, EntryKind::Regular);
@@ -235,7 +264,7 @@ mod tests {
         fs.insert(PathBuf::from("c"), regular(0, 0, 7));
         fs.insert(PathBuf::from("b"), hardlink(0, 1, "c"));
         fs.insert(PathBuf::from("a"), hardlink(0, 2, "b"));
-        resolve(&mut fs).unwrap();
+        resolve(&mut fs, "test image").unwrap();
         assert_eq!(fs.get(Path::new("a")).unwrap().kind, EntryKind::Hardlink);
         assert_eq!(fs.get(Path::new("b")).unwrap().kind, EntryKind::Hardlink);
         assert_eq!(fs.get(Path::new("c")).unwrap().kind, EntryKind::Regular);
@@ -253,7 +282,7 @@ mod tests {
         fs.insert(PathBuf::from("a"), hardlink(0, 2, "b"));
         fs.remove_subtree(Path::new("c"));
 
-        resolve(&mut fs).unwrap();
+        resolve(&mut fs, "test image").unwrap();
 
         let a = fs.get(Path::new("a")).unwrap();
         assert_eq!(a.kind, EntryKind::Hardlink);
@@ -281,7 +310,7 @@ mod tests {
         assert!(fs.contains(Path::new("outside")));
         assert!(!fs.contains(Path::new("dir/a")));
 
-        resolve(&mut fs).unwrap();
+        resolve(&mut fs, "test image").unwrap();
 
         let outside = fs.get(Path::new("outside")).unwrap();
         assert_eq!(outside.kind, EntryKind::Regular);
@@ -303,7 +332,7 @@ mod tests {
         fs.insert(PathBuf::from("b"), hardlink(0, 1, "a"));
         // Neither has a live regular terminal but both direct targets
         // are alive, so resolve() doesn't chase. No error.
-        resolve(&mut fs).unwrap();
+        resolve(&mut fs, "test image").unwrap();
         assert_eq!(fs.get(Path::new("a")).unwrap().kind, EntryKind::Hardlink);
         assert_eq!(fs.get(Path::new("b")).unwrap().kind, EntryKind::Hardlink);
     }
@@ -319,7 +348,7 @@ mod tests {
         fs.insert(PathBuf::from("outside"), hardlink(1, 0, "a"));
         fs.remove_subtree(Path::new("a"));
         fs.remove_subtree(Path::new("b"));
-        let err = resolve(&mut fs).unwrap_err();
+        let err = resolve(&mut fs, "test image").unwrap_err();
         match err {
             Error::MalformedInput(msg) => assert!(msg.contains("cycle"), "msg = {msg}"),
             other => panic!("expected MalformedInput, got {other:?}"),
@@ -330,7 +359,7 @@ mod tests {
     fn missing_target_outside_index_and_shadow_is_an_error() {
         let mut fs = SquashedFs::new();
         fs.insert(PathBuf::from("alias"), hardlink(0, 0, "nowhere"));
-        let err = resolve(&mut fs).unwrap_err();
+        let err = resolve(&mut fs, "test image").unwrap_err();
         match err {
             Error::MalformedInput(msg) => assert!(msg.contains("missing"), "msg = {msg}"),
             other => panic!("expected MalformedInput, got {other:?}"),
@@ -348,7 +377,7 @@ mod tests {
         // Whiteout `etc` so we hit the chase path (live target
         // would be left alone).
         fs.remove_subtree(Path::new("etc"));
-        let err = resolve(&mut fs).unwrap_err();
+        let err = resolve(&mut fs, "test image").unwrap_err();
         match err {
             Error::MalformedInput(msg) => {
                 assert!(msg.contains("non-regular"), "msg = {msg}");
@@ -362,7 +391,7 @@ mod tests {
         let mut fs = SquashedFs::new();
         // Construct a malformed hardlink with no target.
         fs.insert(PathBuf::from("alias"), make_entry(0, 0, EntryKind::Hardlink));
-        let err = resolve(&mut fs).unwrap_err();
+        let err = resolve(&mut fs, "test image").unwrap_err();
         match err {
             Error::MalformedInput(msg) => assert!(msg.contains("link_target"), "msg = {msg}"),
             other => panic!("expected MalformedInput, got {other:?}"),
@@ -389,7 +418,7 @@ mod tests {
         fs.insert(PathBuf::from("usr/bin/sudo"), link);
 
         fs.remove_subtree(Path::new("bin/sudo"));
-        resolve(&mut fs).unwrap();
+        resolve(&mut fs, "test image").unwrap();
 
         let demoted = fs.get(Path::new("usr/bin/sudo")).unwrap();
         assert_eq!(demoted.kind, EntryKind::Regular);
@@ -420,7 +449,7 @@ mod tests {
         // Whiteout again.
         fs.remove_subtree(Path::new("file_x"));
 
-        resolve(&mut fs).unwrap();
+        resolve(&mut fs, "test image").unwrap();
 
         let demoted = fs.get(Path::new("alias")).unwrap();
         assert_eq!(demoted.kind, EntryKind::Regular);
@@ -447,7 +476,7 @@ mod tests {
         assert!(fs.contains(Path::new("alias")));
         assert!(fs.shadow_get(Path::new("d/file")).is_some());
 
-        resolve(&mut fs).unwrap();
+        resolve(&mut fs, "test image").unwrap();
         let demoted = fs.get(Path::new("alias")).unwrap();
         assert_eq!(demoted.kind, EntryKind::Regular);
         assert_eq!(demoted.size, 7);
@@ -467,7 +496,7 @@ mod tests {
         fs.insert(PathBuf::from("alias"), hardlink(0, 1, "file_x"));
         fs.remove_subtree(Path::new("file_x"));
 
-        resolve(&mut fs).unwrap();
+        resolve(&mut fs, "test image").unwrap();
 
         let demoted = fs.get(Path::new("alias")).unwrap();
         assert_eq!(demoted.kind, EntryKind::Regular);

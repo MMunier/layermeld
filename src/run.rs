@@ -133,7 +133,12 @@ pub fn run(config: &Config) -> Result<Summary> {
         .enumerate()
         .map(|(i, img)| {
             let mut fs = apply_image(InputImageId(i), &img.layers)?;
-            resolve_hardlinks(&mut fs)?;
+            let image_label = if img.repo_tags.is_empty() {
+                format!("input image #{i}")
+            } else {
+                format!("input image #{i} ({})", img.repo_tags.join(", "))
+            };
+            resolve_hardlinks(&mut fs, &image_label)?;
             Ok(fs)
         })
         .collect::<Result<Vec<_>>>()?;
